@@ -1,0 +1,1167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Airzooka — axisymmetric flow sandbox</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#161b22; --panel2:#1c232c; --line:#2b3440;
+    --fg:#dfe6ee; --dim:#8b97a6; --accent:#5ec6ff; --warn:#ffb454; --bad:#ff6b6b; --good:#7ee787;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{
+    background:var(--bg); color:var(--fg);
+    font:13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    display:flex; overflow:hidden;
+  }
+  #stage{flex:1 1 auto; display:flex; flex-direction:column; min-width:0; padding:10px; gap:8px}
+  #viewWrap{flex:1 1 auto; position:relative; min-height:0; background:#05070a;
+            border:1px solid var(--line); border-radius:8px; overflow:hidden;
+            display:flex; align-items:center; justify-content:center}
+  #view{display:block; max-width:100%; max-height:100%; image-rendering:auto}
+  #hud{position:absolute; left:10px; top:8px; font:11px/1.4 var(--mono); color:#9fb2c4;
+       text-shadow:0 1px 3px #000; pointer-events:none; white-space:pre}
+  #scalebar{position:absolute; right:10px; bottom:8px; font:11px var(--mono); color:#9fb2c4;
+            text-shadow:0 1px 3px #000; pointer-events:none}
+  #bottom{flex:0 0 190px; display:flex; gap:10px; align-items:stretch; min-height:190px}
+  #plotBox{flex:1 1 auto; background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:6px 8px}
+  #plot{width:100%; height:110px; display:block}
+  #plotTitle{font:11px var(--mono); color:var(--dim); margin-bottom:2px}
+  #metrics{flex:0 0 310px; background:var(--panel); border:1px solid var(--line);
+           border-radius:8px; padding:8px 10px; font:11.5px/1.5 var(--mono); overflow:auto}
+  #metrics .row{display:flex; justify-content:space-between; gap:8px}
+  #metrics .k{color:var(--dim)}
+  #metrics .v{color:var(--fg); text-align:right}
+  #metrics h4{margin:0 0 4px; font:600 11px/1.4 var(--mono); color:var(--accent);
+              letter-spacing:.08em; text-transform:uppercase}
+  #metrics hr{border:0; border-top:1px solid var(--line); margin:7px 0}
+
+  #panel{flex:0 0 330px; background:var(--panel); border-left:1px solid var(--line);
+         overflow-y:auto; padding:10px 12px 40px}
+  #panel h1{font-size:14px; margin:2px 0 2px; letter-spacing:.02em}
+  #panel .sub{color:var(--dim); font-size:11px; margin-bottom:10px}
+  details{border:1px solid var(--line); border-radius:7px; margin-bottom:8px; background:var(--panel2)}
+  details>summary{cursor:pointer; padding:7px 10px; font-weight:600; font-size:12px;
+                  letter-spacing:.04em; text-transform:uppercase; color:var(--accent); list-style:none}
+  details>summary::-webkit-details-marker{display:none}
+  details>summary::before{content:"▸ "; color:var(--dim)}
+  details[open]>summary::before{content:"▾ "}
+  .body{padding:4px 10px 10px}
+  .ctl{margin:8px 0}
+  .ctl .lab{display:flex; justify-content:space-between; align-items:baseline; gap:6px}
+  .ctl .lab span:first-child{color:var(--fg)}
+  .ctl .lab span:last-child{font:11px var(--mono); color:var(--accent)}
+  .ctl input[type=range]{width:100%; margin:3px 0 0; accent-color:var(--accent)}
+  .ctl .hint{font-size:10.5px; color:var(--dim); margin-top:1px}
+  .rebuild .lab span:first-child::after{content:" ↻"; color:var(--dim); font-size:10px}
+  select,button{font:inherit; background:var(--panel2); color:var(--fg);
+                border:1px solid var(--line); border-radius:6px; padding:5px 8px}
+  select{width:100%}
+  button{cursor:pointer}
+  button:hover{border-color:var(--accent)}
+  button.primary{background:#1d4763; border-color:#2d6d95; color:#dff1ff; font-weight:600}
+  .btnrow{display:flex; gap:6px; flex-wrap:wrap; margin:8px 0}
+  .btnrow button{flex:1 1 auto}
+  .presets button{flex:1 1 45%; font-size:11.5px; text-align:left; padding:6px 8px; line-height:1.3}
+  .presets button b{display:block; color:var(--accent); font-size:11.5px}
+  .presets button i{font-style:normal; color:var(--dim); font-size:10.5px}
+  label.chk{display:flex; align-items:center; gap:6px; margin:6px 0; cursor:pointer}
+  #note{font-size:11px; color:var(--dim); margin-top:10px; line-height:1.5}
+  .flag{margin-top:6px; padding:6px 8px; border-radius:6px; font-size:11px; line-height:1.45}
+  .flag.warn{background:#3a2a10; border:1px solid #6b4a15; color:#ffd79a}
+  .flag.bad{background:#3a1616; border:1px solid #6b2020; color:#ffb3b3}
+  .flag.good{background:#12301a; border:1px solid #235c33; color:#b6f0c4}
+  #err{position:fixed; inset:0; background:#0e1116ee; color:#ffb3b3; padding:40px;
+       font:14px/1.6 var(--mono); display:none; z-index:99}
+</style>
+</head>
+<body>
+<div id="stage">
+  <div id="viewWrap">
+    <canvas id="view"></canvas>
+    <div id="hud"></div>
+    <div id="scalebar"></div>
+  </div>
+  <div id="bottom">
+    <div id="plotBox">
+      <div id="plotTitle"></div>
+      <canvas id="plot"></canvas>
+    </div>
+    <div id="metrics"></div>
+  </div>
+</div>
+<div id="panel">
+  <h1>Airzooka flow sandbox</h1>
+  <div class="sub">Axisymmetric (r–z) incompressible solver. The view is a slice through the
+  axis; the barrel is a solid of revolution about the centreline.</div>
+  <div class="btnrow">
+    <button id="fire" class="primary">Fire ⏎</button>
+    <button id="pause">Pause</button>
+    <button id="reset">Reset</button>
+  </div>
+  <div id="controls"></div>
+  <div id="note"></div>
+</div>
+<div id="err"></div>
+<script>
+"use strict";
+/* ==========================================================================
+   Airzooka — axisymmetric incompressible flow sandbox
+   --------------------------------------------------------------------------
+   Coordinates: p = (z, r).  z = axial (barrel points +z), r = radial, r>=0.
+   Grid: MAC / staggered, Nz x Nr cells.
+     cell centre (iz,ir) : z=(iz+.5)dz, r=(ir+.5)dr   -> pressure, dye
+     u_r  at texel(iz,ir): z=(iz+.5)dz, r= ir*dr      -> radial face
+     u_z  at texel(iz,ir): z= iz*dz,    r=(ir+.5)dr   -> axial face
+     omega at texel(iz,ir): z= iz*dz,   r= ir*dr      -> node (corner)
+   Velocity/vorticity textures are (Nz+1) x (Nr+1) so every face exists.
+   Units: millimetres, milliseconds. (1 mm/ms = 1 m/s.)
+   ========================================================================== */
+
+const FSHEAD = `#version 300 es
+precision highp float; precision highp int; precision highp sampler2D;
+out vec4 fragColor;
+`;
+
+/* ---- uniforms + helpers shared by every fragment shader ---- */
+const COMMON = `
+uniform ivec2 uCells;      // Nz, Nr
+uniform ivec2 uFaces;      // Nz+1, Nr+1
+uniform float uDz, uDr, uDt;
+uniform float uLz, uRmax;
+uniform float uZ0, uZ1;                       // barrel tube: back, front (before plate)
+uniform float uBoreR, uWallT, uExitR, uPlateT, uTaper;
+uniform float uPz0, uPz1, uPr, uPv;           // piston back z, front z, radius, axial velocity
+uniform float uVisc, uVortEps, uDyeDiss, uSmag;
+uniform int   uSeed;
+uniform sampler2D uVel, uPres, uDivT, uDye, uVort, uSrc;
+
+const int FLUID = 0, WALL = 1, PISTON = 2;
+
+int solidAt(vec2 p){
+  float z = p.x, r = p.y;
+  if (z >= uPz0 && z <= uPz1 && r <= uPr) return PISTON;
+  float outR = uBoreR + uWallT;
+  if (z >= uZ0 && z <= uZ1 + uPlateT && r <= outR){
+    float rin;
+    if (z <= uZ1 - uTaper)      rin = uBoreR;
+    else if (z <= uZ1)          rin = (uTaper > 0.0)
+                                    ? mix(uBoreR, uExitR, (z - (uZ1 - uTaper)) / uTaper)
+                                    : uBoreR;
+    else                        rin = uExitR;
+    if (r >= rin) return WALL;
+  }
+  return FLUID;
+}
+int solidCell(ivec2 c){
+  return solidAt(vec2((float(c.x)+0.5)*uDz, (float(c.y)+0.5)*uDr));
+}
+vec2 cellCentre(ivec2 c){ return vec2((float(c.x)+0.5)*uDz, (float(c.y)+0.5)*uDr); }
+
+vec4 fV(ivec2 c){ return texelFetch(uVel, clamp(c, ivec2(0), uFaces - 1), 0); }
+float fD(ivec2 c){ return texelFetch(uDye, clamp(c, ivec2(0), uCells - 1), 0).x; }
+float fW(ivec2 c){ return texelFetch(uVort, clamp(c, ivec2(0), uFaces - 1), 0).x; }
+float fP(ivec2 c){ return texelFetch(uPres, clamp(c, ivec2(0), uCells - 1), 0).x; }
+
+// bilinear samples of the staggered components at an arbitrary world point
+float sampleUr(vec2 p){
+  vec2 f = vec2(p.x/uDz - 0.5, p.y/uDr);
+  vec2 fl = floor(f); ivec2 i = ivec2(fl); vec2 s = f - fl;
+  return mix(mix(fV(i).x, fV(i+ivec2(1,0)).x, s.x),
+             mix(fV(i+ivec2(0,1)).x, fV(i+ivec2(1,1)).x, s.x), s.y);
+}
+float sampleUz(vec2 p){
+  vec2 f = vec2(p.x/uDz, p.y/uDr - 0.5);
+  vec2 fl = floor(f); ivec2 i = ivec2(fl); vec2 s = f - fl;
+  return mix(mix(fV(i).y, fV(i+ivec2(1,0)).y, s.x),
+             mix(fV(i+ivec2(0,1)).y, fV(i+ivec2(1,1)).y, s.x), s.y);
+}
+float sampleDye(vec2 p){
+  vec2 f = vec2(p.x/uDz - 0.5, p.y/uDr - 0.5);
+  vec2 fl = floor(f); ivec2 i = ivec2(fl); vec2 s = f - fl;
+  return mix(mix(fD(i), fD(i+ivec2(1,0)), s.x),
+             mix(fD(i+ivec2(0,1)), fD(i+ivec2(1,1)), s.x), s.y);
+}
+vec2 velAt(vec2 p){ return vec2(sampleUz(p), sampleUr(p)); }   // (vz, vr), matches p=(z,r)
+
+// 2nd-order Runge-Kutta backtrace, clamped to the domain
+vec2 backtrace(vec2 p){
+  vec2 v  = velAt(p);
+  vec2 pm = p - 0.5*uDt*v;
+  vec2 pb = p - uDt*velAt(pm);
+  return clamp(pb, vec2(0.0), vec2(uLz, uRmax));
+}
+`;
+
+const VERT = `#version 300 es
+void main(){
+  vec2 v = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+  gl_Position = vec4(v * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+/* ---- advect the staggered velocity field ---- */
+const FS_ADVECT_VEL = FSHEAD + COMMON + `
+void main(){
+  ivec2 c = ivec2(gl_FragCoord.xy);
+  float nur = 0.0, nuz = 0.0;
+  if (c.y > 0 && c.x < uCells.x){
+    vec2 p = vec2((float(c.x)+0.5)*uDz, float(c.y)*uDr);
+    nur = sampleUr(backtrace(p));
+  }
+  if (c.y < uCells.y){
+    vec2 p = vec2(float(c.x)*uDz, (float(c.y)+0.5)*uDr);
+    nuz = sampleUz(backtrace(p));
+  }
+  fragColor = vec4(nur, nuz, 0.0, 0.0);
+}`;
+
+/* ---- azimuthal vorticity at nodes: w = du_r/dz - du_z/dr ---- */
+const FS_VORT = FSHEAD + COMMON + `
+void main(){
+  ivec2 c = ivec2(gl_FragCoord.xy);
+  float dur_dz = (fV(c).x - fV(c - ivec2(1,0)).x) / uDz;
+  float duz_dr = (fV(c).y - fV(c - ivec2(0,1)).y) / uDr;
+  fragColor = vec4(dur_dz - duz_dr, 0.0, 0.0, 0.0);
+}`;
+
+/* ---- viscous diffusion (axisymmetric Laplacian) + vorticity confinement ---- */
+const FS_FORCES = FSHEAD + COMMON + `
+/* Smagorinsky sub-grid viscosity. Without it an axisymmetric solver produces a laminar
+   jet that refuses to spread, because the 3-D azimuthal instabilities that actually break
+   a real jet up are excluded by the symmetry assumption. */
+float eddyVisc(ivec2 c){
+  if (uSmag <= 0.0) return 0.0;
+  float rc = (float(c.y)+0.5)*uDr;
+  float durdr = (fV(c+ivec2(0,1)).x - fV(c).x)/uDr;
+  float duzdz = (fV(c+ivec2(1,0)).y - fV(c).y)/uDz;
+  float urc   = 0.5*(fV(c).x + fV(c+ivec2(0,1)).x);
+  float stt   = urc/max(rc, 1e-6);
+  float durdz = 0.25*((fV(c+ivec2(1,0)).x - fV(c-ivec2(1,0)).x)
+                    + (fV(c+ivec2(1,1)).x - fV(c+ivec2(-1,1)).x))/uDz;
+  float duzdr = 0.25*((fV(c+ivec2(0,1)).y - fV(c-ivec2(0,1)).y)
+                    + (fV(c+ivec2(1,1)).y - fV(c+ivec2(1,-1)).y))/uDr;
+  float srz = 0.5*(durdz + duzdr);
+  float s2  = 2.0*(durdr*durdr + duzdz*duzdz + stt*stt) + 4.0*srz*srz;
+  float d   = sqrt(uDr*uDz);
+  return uSmag*uSmag*d*d*sqrt(max(s2, 0.0));
+}
+void main(){
+  ivec2 c = ivec2(gl_FragCoord.xy);
+  vec4  v = fV(c);
+  float ur = v.x, uz = v.y;
+  float dr2 = uDr*uDr, dz2 = uDz*uDz;
+  // molecular + sub-grid, capped so the explicit diffusion stays stable
+  float nu = uVisc + eddyVisc(clamp(c, ivec2(0), uCells - 1));
+  nu = min(nu, 0.25*min(dr2, dz2)/max(uDt, 1e-9));
+
+  // ---- u_r at r = ir*dr ----
+  if (c.y > 0){
+    float rf = float(c.y)*uDr;
+    float rp = rf + 0.5*uDr, rm = rf - 0.5*uDr;
+    float lap = (rp*(fV(c+ivec2(0,1)).x - ur) - rm*(ur - fV(c-ivec2(0,1)).x)) / (rf*dr2)
+              - ur/(rf*rf)
+              + (fV(c+ivec2(1,0)).x - 2.0*ur + fV(c-ivec2(1,0)).x) / dz2;
+    ur += uDt*nu*lap;
+  } else ur = 0.0;   // on the axis u_r is identically zero
+
+  // ---- u_z at r = (ir+.5)dr ----
+  {
+    float rc = (float(c.y)+0.5)*uDr;
+    float rp = float(c.y+1)*uDr, rm = float(c.y)*uDr;   // rm = 0 on axis -> symmetry for free
+    float lap = (rp*(fV(c+ivec2(0,1)).y - uz) - rm*(uz - fV(c-ivec2(0,1)).y)) / (rc*dr2)
+              + (fV(c+ivec2(1,0)).y - 2.0*uz + fV(c-ivec2(1,0)).y) / dz2;
+    uz += uDt*nu*lap;
+  }
+
+  // ---- vorticity confinement (restores rings thinned by numerical diffusion) ----
+  if (uVortEps > 0.0){
+    float h = 0.5*(uDr + uDz);
+    float w00=abs(fW(c)), wz1=abs(fW(c+ivec2(1,0))), wzm=abs(fW(c-ivec2(1,0)));
+    float wr1=abs(fW(c+ivec2(0,1))), wrm=abs(fW(c-ivec2(0,1)));
+    if (c.y > 0){
+      float wf = 0.5*(fW(c) + fW(c+ivec2(1,0)));
+      float gz = (wz1 - w00)/uDz;
+      float gr = 0.25*((abs(fW(c+ivec2(0,1))) + abs(fW(c+ivec2(1,1))))
+                     - (abs(fW(c-ivec2(0,1))) + abs(fW(c+ivec2(1,-1)))))/uDr;
+      vec2 n = vec2(gz, gr); float L = length(n);
+      if (L > 1e-9){ n /= L; ur += uDt*uVortEps*h*(-n.x*wf); }
+    }
+    {
+      float wf = 0.5*(fW(c) + fW(c+ivec2(0,1)));
+      float gr = (wr1 - w00)/uDr;
+      float gz = 0.25*((abs(fW(c+ivec2(1,0))) + abs(fW(c+ivec2(1,1))))
+                     - (abs(fW(c-ivec2(1,0))) + abs(fW(c-ivec2(1,-1)))))/uDz;
+      vec2 n = vec2(gz, gr); float L = length(n);
+      if (L > 1e-9){ n /= L; uz += uDt*uVortEps*h*( n.y*wf); }
+    }
+  }
+  fragColor = vec4(ur, uz, 0.0, 0.0);
+}`;
+
+/* ---- stamp solid-body velocities onto faces touching a solid ---- */
+const FS_SOLIDS = FSHEAD + COMMON + `
+void main(){
+  ivec2 c = ivec2(gl_FragCoord.xy);
+  vec4  v = fV(c);
+  float ur = v.x, uz = v.y;
+
+  // radial face between cells (iz, ir-1) and (iz, ir): every surface here is axial-facing,
+  // so the wall-normal radial velocity is zero.
+  if (c.y == 0) ur = 0.0;
+  else {
+    int a = solidCell(ivec2(c.x, c.y-1));
+    int b = solidCell(ivec2(c.x, c.y  ));
+    if (a != FLUID || b != FLUID) ur = 0.0;
+  }
+  // axial face between cells (iz-1, ir) and (iz, ir)
+  {
+    int a = (c.x > 0)          ? solidCell(ivec2(c.x-1, c.y)) : FLUID;
+    int b = (c.x < uCells.x)   ? solidCell(ivec2(c.x  , c.y)) : FLUID;
+    if (a == WALL || b == WALL)       uz = 0.0;
+    else if (a == PISTON || b == PISTON) uz = uPv;
+  }
+  fragColor = vec4(ur, uz, 0.0, 0.0);
+}`;
+
+/* ---- divergence, conservative in cylindrical coordinates ---- */
+const FS_DIV = FSHEAD + COMMON + `
+void main(){
+  ivec2 c = ivec2(gl_FragCoord.xy);
+  if (solidCell(c) != FLUID){ fragColor = vec4(0.0); return; }
+  float rc = (float(c.y)+0.5)*uDr;
+  float rm = float(c.y)*uDr, rp = float(c.y+1)*uDr;
+  float urm = fV(c).x, urp = fV(c + ivec2(0,1)).x;
+  float uzm = fV(c).y, uzp = fV(c + ivec2(1,0)).y;
+  float d = (rp*urp - rm*urm)/(rc*uDr) + (uzp - uzm)/uDz;
+  fragColor = vec4(d, 0.0, 0.0, 0.0);
+}`;
+
+/* ---- Jacobi sweep on the pressure Poisson equation ----
+   Neumann (dp/dn = 0) at solids, Dirichlet p = 0 at the open outer boundaries.
+   The r-weighting makes the composite operator exactly the cylindrical Laplacian. ---- */
+const FS_JACOBI = FSHEAD + COMMON + `
+void main(){
+  ivec2 c = ivec2(gl_FragCoord.xy);
+  if (solidCell(c) != FLUID){ fragColor = vec4(0.0); return; }
+  float rc = (float(c.y)+0.5)*uDr;
+  float aM = (float(c.y)  *uDr)/(rc*uDr*uDr);   // 0 on the axis -> symmetry for free
+  float aP = (float(c.y+1)*uDr)/(rc*uDr*uDr);
+  float b  = 1.0/(uDz*uDz);
+  float num = 0.0, den = 0.0;
+
+  if (c.y > 0){
+    if (solidCell(c-ivec2(0,1)) == FLUID){ num += aM*fP(c-ivec2(0,1)); den += aM; }
+  }
+  if (c.y < uCells.y-1){
+    if (solidCell(c+ivec2(0,1)) == FLUID){ num += aP*fP(c+ivec2(0,1)); den += aP; }
+  } else { den += aP; }                                  // open outer wall, p = 0
+  if (c.x > 0){
+    if (solidCell(c-ivec2(1,0)) == FLUID){ num += b*fP(c-ivec2(1,0)); den += b; }
+  } else { den += b; }                                   // open back, p = 0
+  if (c.x < uCells.x-1){
+    if (solidCell(c+ivec2(1,0)) == FLUID){ num += b*fP(c+ivec2(1,0)); den += b; }
+  } else { den += b; }                                   // open muzzle end, p = 0
+
+  float rhs = texelFetch(uDivT, c, 0).x / uDt;
+  fragColor = vec4(den > 1e-12 ? (num - rhs)/den : 0.0, 0.0, 0.0, 0.0);
+}`;
+
+/* ---- project: u -= dt * grad p ---- */
+const FS_PROJ = FSHEAD + COMMON + `
+void main(){
+  ivec2 c = ivec2(gl_FragCoord.xy);
+  vec4  v = fV(c);
+  float ur = v.x, uz = v.y;
+  if (c.y > 0 && c.y <= uCells.y && c.x < uCells.x){
+    float pIn = fP(ivec2(c.x, c.y-1));
+    float pOut = (c.y < uCells.y) ? fP(c) : 0.0;          // open outer wall
+    ur -= uDt*(pOut - pIn)/uDr;
+  } else ur = 0.0;
+  if (c.y < uCells.y){
+    float pL = (c.x > 0)        ? fP(ivec2(c.x-1, c.y)) : 0.0;
+    float pR = (c.x < uCells.x) ? fP(c)                 : 0.0;
+    uz -= uDt*(pR - pL)/uDz;
+  }
+  fragColor = vec4(ur, uz, 0.0, 0.0);
+}`;
+
+/* ---- dye: advect, decay, and re-seed the slug of air in front of the piston ---- */
+const FS_DYE = FSHEAD + COMMON + `
+void main(){
+  ivec2 c = ivec2(gl_FragCoord.xy);
+  vec2  p = cellCentre(c);
+  if (solidAt(p) != FLUID){ fragColor = vec4(0.0); return; }
+  float d = sampleDye(backtrace(p)) * exp(-uDyeDiss*uDt);
+  if (uSeed == 1 && p.y <= uPr && p.x >= uPz1 && p.x <= uPz1 + 3.0) d = 1.0;
+  fragColor = vec4(clamp(d, 0.0, 1.0), 0.0, 0.0, 0.0);
+}`;
+
+const FS_DYE_INIT = FSHEAD + COMMON + `
+void main(){
+  ivec2 c = ivec2(gl_FragCoord.xy);
+  vec2  p = cellCentre(c);
+  bool inBarrel = (solidAt(p) == FLUID) && p.x > uZ0 && p.x < uZ1 + uPlateT && p.y < uBoreR;
+  fragColor = vec4(inBarrel ? 1.0 : 0.0, 0.0, 0.0, 0.0);
+}`;
+
+const FS_CLEAR = FSHEAD + `void main(){ fragColor = vec4(0.0); }`;
+
+/* ---- max |u| reduction, so the timestep can follow the real CFL limit ---- */
+const FS_REDUCE = FSHEAD + `
+uniform sampler2D uSrc; uniform ivec2 uSrcSize; uniform int uFirst;
+void main(){
+  ivec2 b = ivec2(gl_FragCoord.xy) * 2;
+  float m = 0.0;
+  for (int j = 0; j < 2; j++) for (int i = 0; i < 2; i++){
+    vec4 v = texelFetch(uSrc, clamp(b + ivec2(i,j), ivec2(0), uSrcSize - 1), 0);
+    m = max(m, uFirst == 1 ? max(abs(v.x), abs(v.y)) : v.x);
+  }
+  fragColor = vec4(m, 0.0, 0.0, 0.0);
+}`;
+</script>
+<script>
+"use strict";
+/* ---- display: mirrors the r>=0 half about the axis and overlays the hardware ---- */
+const FS_SHOW = FSHEAD + COMMON + `
+uniform vec2  uViewport;
+uniform int   uField;      // 0 dye, 1 speed, 2 vorticity, 3 pressure, 4 axial velocity
+uniform float uScale;
+uniform int   uShowGeom, uShowGrid;
+uniform float uProbeZ;
+
+vec3 viridis(float t){
+  t = clamp(t, 0.0, 1.0);
+  const vec3 c0=vec3(0.2777,0.0054,0.3341), c1=vec3(0.1051,1.4046,1.3846);
+  const vec3 c2=vec3(-0.3309,0.2148,0.0951), c3=vec3(-4.6342,-5.7991,-19.3324);
+  const vec3 c4=vec3(6.2283,14.1799,56.6906), c5=vec3(4.7764,-13.7451,-65.3530);
+  const vec3 c6=vec3(-5.4355,4.6459,26.3124);
+  return clamp(c0+t*(c1+t*(c2+t*(c3+t*(c4+t*(c5+t*c6))))), 0.0, 1.0);
+}
+vec3 diverging(float t){                       // t in [-1,1]
+  float a = clamp(abs(t), 0.0, 1.0);
+  vec3 cold = vec3(0.25,0.55,1.0), warm = vec3(1.0,0.42,0.25);
+  vec3 c = t < 0.0 ? cold : warm;
+  return mix(vec3(0.055,0.07,0.09), c, pow(a, 0.75));
+}
+vec2 velCentre(ivec2 c){
+  return vec2(0.5*(fV(c).y + fV(c+ivec2(1,0)).y),   // u_z
+              0.5*(fV(c).x + fV(c+ivec2(0,1)).x));  // u_r
+}
+void main(){
+  vec2 uv = gl_FragCoord.xy / uViewport;
+  float z = uv.x * uLz;
+  float r = abs((uv.y - 0.5) * 2.0 * uRmax);
+  vec2  p = vec2(z, r);
+  ivec2 c = clamp(ivec2(floor(vec2(z/uDz, r/uDr))), ivec2(0), uCells - 1);
+
+  vec3 col = vec3(0.055, 0.07, 0.09);
+  int s = solidAt(p);
+
+  if (s == FLUID){
+    if (uField == 0){
+      float d = clamp(sampleDye(p), 0.0, 1.0);
+      col = mix(col, vec3(0.86,0.93,1.0), pow(d, 0.7));
+    } else if (uField == 1){
+      vec2 v = velCentre(c);
+      col = viridis(length(v)/max(uScale,1e-6));
+    } else if (uField == 2){
+      float w = 0.25*(fW(c) + fW(c+ivec2(1,0)) + fW(c+ivec2(0,1)) + fW(c+ivec2(1,1)));
+      float sgn = ((uv.y - 0.5) < 0.0) ? -1.0 : 1.0;   // mirrored half spins the other way
+      col = diverging(clamp(sgn*w/max(uScale,1e-6), -1.0, 1.0));
+    } else if (uField == 3){
+      col = diverging(clamp(fP(c)/max(uScale,1e-6), -1.0, 1.0));
+    } else {
+      col = diverging(clamp(velCentre(c).x/max(uScale,1e-6), -1.0, 1.0));
+    }
+    // faint dye wash over the physical fields so the slug stays visible
+    if (uField != 0) col = mix(col, vec3(1.0), 0.16*clamp(sampleDye(p),0.0,1.0));
+  } else if (uShowGeom == 1){
+    col = (s == PISTON) ? vec3(0.83,0.55,0.20) : vec3(0.30,0.35,0.42);
+    float edge = mod(z*0.5 + r*0.5, 3.0) < 1.5 ? 0.04 : 0.0;   // subtle hatch
+    col += edge;
+  } else col = vec3(0.10,0.11,0.13);
+
+  // centreline
+  if (abs(uv.y - 0.5) * uViewport.y < 0.6) col = mix(col, vec3(0.45,0.55,0.65), 0.5);
+  // probe plane
+  if (abs(z - uProbeZ) < uDz*0.6) col = mix(col, vec3(1.0,0.85,0.35), 0.45);
+
+  fragColor = vec4(col, 1.0);
+}`;
+
+/* ========================== WebGL plumbing ========================== */
+const canvas = document.getElementById('view');
+const gl = canvas.getContext('webgl2', { antialias:false, depth:false, stencil:false,
+                                         preserveDrawingBuffer:false, powerPreference:'high-performance' });
+function fatal(msg){
+  const e = document.getElementById('err');
+  e.style.display = 'block'; e.textContent = msg; throw new Error(msg);
+}
+if (!gl) fatal('WebGL2 is not available in this browser.');
+if (!gl.getExtension('EXT_color_buffer_float'))
+  fatal('This GPU/browser cannot render to float textures (EXT_color_buffer_float missing).');
+
+function compile(type, src){
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)){
+    const log = gl.getShaderInfoLog(s);
+    const numbered = src.split('\n').map((l,i)=>String(i+1).padStart(4)+' | '+l).join('\n');
+    fatal('Shader compile error:\n' + log + '\n\n' + numbered);
+  }
+  return s;
+}
+function program(fs){
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, VERT));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) fatal('Link error: ' + gl.getProgramInfoLog(p));
+  p._loc = new Map();
+  return p;
+}
+function loc(p, name){
+  if (!p._loc.has(name)) p._loc.set(name, gl.getUniformLocation(p, name));
+  return p._loc.get(name);
+}
+
+const emptyVAO = gl.createVertexArray();
+
+function makeTarget(w, h, internal = gl.RGBA32F, format = gl.RGBA){
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texStorage2D(gl.TEXTURE_2D, 1, internal, w, h);
+  for (const k of [gl.TEXTURE_MIN_FILTER, gl.TEXTURE_MAG_FILTER])
+    gl.texParameteri(gl.TEXTURE_2D, k, gl.NEAREST);
+  for (const k of [gl.TEXTURE_WRAP_S, gl.TEXTURE_WRAP_T])
+    gl.texParameteri(gl.TEXTURE_2D, k, gl.CLAMP_TO_EDGE);
+  const fbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE)
+    fatal('Incomplete framebuffer at ' + w + 'x' + h);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  return { tex, fbo, w, h, format };
+}
+function makeDouble(w, h, internal, format){
+  return { a: makeTarget(w,h,internal,format), b: makeTarget(w,h,internal,format),
+           get read(){ return this.a; }, get write(){ return this.b; },
+           swap(){ const t = this.a; this.a = this.b; this.b = t; } };
+}
+function destroyTarget(t){ if (t){ gl.deleteTexture(t.tex); gl.deleteFramebuffer(t.fbo); } }
+
+const PROG = {};
+function buildPrograms(){
+  PROG.advectVel = program(FS_ADVECT_VEL);
+  PROG.vort      = program(FS_VORT);
+  PROG.forces    = program(FS_FORCES);
+  PROG.solids    = program(FS_SOLIDS);
+  PROG.div       = program(FS_DIV);
+  PROG.jacobi    = program(FS_JACOBI);
+  PROG.proj      = program(FS_PROJ);
+  PROG.dye       = program(FS_DYE);
+  PROG.dyeInit   = program(FS_DYE_INIT);
+  PROG.clear     = program(FS_CLEAR);
+  PROG.reduce    = program(FS_REDUCE);
+  PROG.show      = program(FS_SHOW);
+}
+buildPrograms();
+</script>
+<script>
+"use strict";
+/* ========================== parameters ========================== */
+const CONTROLS = [
+ { group:'Geometry — barrel (mm)', open:true, items:[
+   { k:'boreR',      t:'Bore radius (inner)',    min:5,   max:60,  step:0.5,  v:25,   rebuild:true,
+     hint:'airzooker.scad: barrel_inner_radius' },
+   { k:'wallT',      t:'Wall thickness',         min:0.5, max:8,   step:0.1,  v:2.5,  rebuild:true },
+   { k:'barrelLen',  t:'Barrel length',          min:20,  max:300, step:1,    v:100,  rebuild:true,
+     hint:'barrel_rear_length' },
+   { k:'exitR',      t:'Exit orifice radius',    min:1,   max:60,  step:0.5,  v:5,    rebuild:true,
+     hint:'end_cap exit_radius — the single most important number here' },
+   { k:'plateT',     t:'Orifice plate thickness',min:0.4, max:15,  step:0.1,  v:2.5,  rebuild:true },
+   { k:'taper',      t:'Internal taper length',  min:0,   max:100, step:1,    v:0,    rebuild:true,
+     hint:'0 = sharp-edged plate (as modelled). >0 turns the barrel mouth into a cone.' },
+ ]},
+ { group:'Geometry — piston (mm)', items:[
+   { k:'pistonT',    t:'Piston thickness',       min:1,   max:25,  step:0.5,  v:5,    rebuild:true },
+   { k:'pistonClr',  t:'Piston radial clearance',min:0,   max:5,   step:0.05, v:0.5,  rebuild:true,
+     hint:'Print tolerance. Air that leaks past never leaves the muzzle.' },
+ ]},
+ { group:'Drive', open:true, items:[
+   { k:'stroke',     t:'Stroke',                 min:5,   max:250, step:1,    v:80,   unit:'mm' },
+   { k:'pushMs',     t:'Push duration',          min:2,   max:400, step:1,    v:40,   unit:'ms',
+     hint:'Half-sine velocity profile. Short = spring/elastic snap, long = hand shove.' },
+ ]},
+ { group:'Fluid', items:[
+   { k:'visc',       t:'Kinematic viscosity',    min:0,   max:1,   step:0.0005, v:0.0151, unit:'mm²/ms',
+     hint:'Air at 20 °C = 0.0151. Raise it to damp grid-scale noise.' },
+   { k:'smag',       t:'Turbulence model (Smagorinsky Cs)', min:0, max:0.45, step:0.005, v:0.17,
+     hint:'Stands in for the 3-D turbulent mixing this symmetric model cannot represent. ' +
+          'At 0 the jet stays laminar and flies unrealistically far; 0.15–0.2 is the usual range.' },
+   { k:'vortEps',    t:'Vorticity confinement',  min:0,   max:6,   step:0.05, v:0.25,
+     hint:'Puts back circulation lost to numerical diffusion, so ring cores stay tight. ' +
+          'It works against the turbulence model — raise one or the other, not both.' },
+   { k:'dyeDiss',    t:'Tracer fade',            min:0,   max:0.05,step:0.001,v:0,    unit:'/ms' },
+ ]},
+ { group:'Domain & solver', items:[
+   { k:'downrange',  t:'Downrange domain',       min:50,  max:1200,step:10,   v:300,  unit:'mm', rebuild:true },
+   { k:'res',        t:'Radial cells',           min:48,  max:352, step:16,   v:144,  rebuild:true,
+     hint:'Cost scales as res². The orifice needs ≳6 cells across to mean anything.' },
+   { k:'iters',      t:'Pressure iterations',    min:10,  max:400, step:5,    v:120,
+     hint:'Jacobi converges slowly and this problem is strongly constrained. Results still ' +
+          'shift by a few percent below ~150; above that they are settled.' },
+   { k:'cfl',        t:'CFL number',             min:0.2, max:2.5, step:0.05, v:1.0 },
+   { k:'spf',        t:'Solver steps / frame',   min:1,   max:200, step:1,    v:20 },
+ ]},
+ { group:'Measurement', items:[
+   { k:'probe',      t:'Target distance from muzzle', min:10, max:1000, step:5, v:150, unit:'mm' },
+ ]},
+];
+
+const P = {};
+for (const g of CONTROLS) for (const it of g.items) P[it.k] = it.v;
+const VIEW = { field:0, scale:'auto', showGeom:true, mirror:true };
+
+const PRESETS = [
+  { n:'As printed', d:'5 mm exit, sharp plate', p:{ exitR:5, taper:0, plateT:2.5, stroke:80, pushMs:40 } },
+  { n:'Optimal ring', d:'exit sized for L/D ≈ 4', p:{ taper:0, stroke:80, pushMs:40 }, auto:'ld4' },
+  { n:'Tapered nozzle', d:'25 mm cone into 15 mm', p:{ exitR:15, taper:25, stroke:80, pushMs:40 } },
+  { n:'Classic airzooka', d:'near full-bore mouth', p:{ exitR:23, taper:0, plateT:2.5, stroke:80, pushMs:25 } },
+];
+
+/* ========================== simulation state ========================== */
+const S = {
+  Nz:0, Nr:0, dz:0, dr:0, Lz:0, Rmax:0, Z0:0, Z1:0,
+  vel:null, pres:null, dye:null, div:null, vort:null, reduce:[],
+  t:0, firing:false, running:true, pistonX:0, pistonV:0,
+  vmax:1, frameDt:0, steps:0,
+  series:[], peak:0, peakT:-1, arrival:-1,
+};
+
+function pistonKinematics(t){
+  const T = P.pushMs, Smax = maxStroke(), Sd = Math.min(P.stroke, Smax);
+  const Vmax = Math.PI * Sd / (2 * T);
+  if (t <= 0)  return { x:0,  v:0 };
+  if (t >= T)  return { x:Sd, v:0 };
+  return { x: (Vmax*T/Math.PI) * (1 - Math.cos(Math.PI*t/T)),
+           v: Vmax * Math.sin(Math.PI*t/T) };
+}
+function pistonBackStart(){ return S.Z0 + 1.0; }
+function maxStroke(){
+  return Math.max(1, (S.Z1 - P.taper - 2.0) - (pistonBackStart() + P.pistonT));
+}
+
+function buildGrid(){
+  const outR = P.boreR + P.wallT;
+  S.Rmax = Math.max(3.0*outR, outR + 25);
+  S.Z0   = 1.3*P.boreR + 8;
+  S.Z1   = S.Z0 + P.barrelLen;
+  S.Lz   = S.Z1 + P.plateT + P.downrange;
+
+  S.Nr = Math.round(P.res);
+  S.dr = S.Rmax / S.Nr;
+  S.Nz = Math.max(48, Math.min(2400, Math.round(S.Lz / S.dr)));
+  S.dz = S.Lz / S.Nz;
+
+  for (const t of [S.div]) destroyTarget(t);
+  for (const d of [S.vel, S.pres, S.dye, S.vort]) if (d){ destroyTarget(d.a); destroyTarget(d.b); }
+  for (const t of S.reduce) destroyTarget(t);
+
+  const fw = S.Nz + 1, fh = S.Nr + 1;
+  S.vel  = makeDouble(fw, fh, gl.RGBA32F, gl.RGBA);
+  S.vort = makeDouble(fw, fh, gl.R32F,    gl.RED);
+  S.pres = makeDouble(S.Nz, S.Nr, gl.R32F, gl.RED);
+  S.dye  = makeDouble(S.Nz, S.Nr, gl.R32F, gl.RED);
+  S.div  = makeTarget(S.Nz, S.Nr, gl.R32F, gl.RED);
+
+  destroyReader(S.rdMax); destroyReader(S.rdProbe);
+  S.rdMax   = makeReader(4);
+  S.rdProbe = makeReader((S.Nr + 1) * 4);
+
+  S.reduce = [];
+  let w = fw, h = fh;
+  while (w > 1 || h > 1){
+    w = Math.max(1, Math.ceil(w/2)); h = Math.max(1, Math.ceil(h/2));
+    S.reduce.push(makeTarget(w, h, gl.RGBA32F, gl.RGBA));
+  }
+  resizeCanvas();
+  resetSim();
+}
+
+function setCommon(p){
+  gl.uniform2i(loc(p,'uCells'), S.Nz, S.Nr);
+  gl.uniform2i(loc(p,'uFaces'), S.Nz+1, S.Nr+1);
+  gl.uniform1f(loc(p,'uDz'), S.dz);
+  gl.uniform1f(loc(p,'uDr'), S.dr);
+  gl.uniform1f(loc(p,'uDt'), S.dt || 0.01);
+  gl.uniform1f(loc(p,'uLz'), S.Lz);
+  gl.uniform1f(loc(p,'uRmax'), S.Rmax);
+  gl.uniform1f(loc(p,'uZ0'), S.Z0);
+  gl.uniform1f(loc(p,'uZ1'), S.Z1);
+  gl.uniform1f(loc(p,'uBoreR'), P.boreR);
+  gl.uniform1f(loc(p,'uWallT'), P.wallT);
+  gl.uniform1f(loc(p,'uExitR'), Math.min(P.exitR, P.boreR));
+  gl.uniform1f(loc(p,'uPlateT'), P.plateT);
+  gl.uniform1f(loc(p,'uTaper'), Math.min(P.taper, P.barrelLen - 2));
+  const pz0 = pistonBackStart() + S.pistonX;
+  gl.uniform1f(loc(p,'uPz0'), pz0);
+  gl.uniform1f(loc(p,'uPz1'), pz0 + P.pistonT);
+  gl.uniform1f(loc(p,'uPr'),  Math.max(0.1, P.boreR - P.pistonClr));
+  gl.uniform1f(loc(p,'uPv'),  S.pistonV);
+  gl.uniform1f(loc(p,'uVisc'), P.visc);
+  gl.uniform1f(loc(p,'uSmag'), P.smag);
+  gl.uniform1f(loc(p,'uVortEps'), P.vortEps);
+  gl.uniform1f(loc(p,'uDyeDiss'), P.dyeDiss);
+  gl.uniform1i(loc(p,'uSeed'), S.firing ? 1 : 0);
+}
+
+function run(prog, target, tex, extra){
+  gl.useProgram(prog);
+  setCommon(prog);
+  let unit = 0;
+  if (tex) for (const name in tex){
+    gl.activeTexture(gl.TEXTURE0 + unit);
+    gl.bindTexture(gl.TEXTURE_2D, tex[name]);
+    gl.uniform1i(loc(prog, name), unit); unit++;
+  }
+  if (extra) extra(prog);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, target ? target.fbo : null);
+  gl.viewport(0, 0, target ? target.w : canvas.width, target ? target.h : canvas.height);
+  gl.bindVertexArray(emptyVAO);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+
+function clearTarget(t){ run(PROG.clear, t); }
+
+function resetSim(){
+  S.t = 0; S.pistonX = 0; S.pistonV = 0; S.firing = true; S.dt = 0.01;
+  S.series.length = 0; S.peak = 0; S.peakT = -1; S.arrival = -1; S.vmax = 1;
+  for (const d of [S.vel, S.pres, S.vort]){ clearTarget(d.a); clearTarget(d.b); }
+  clearTarget(S.div);
+  run(PROG.dyeInit, S.dye.write); S.dye.swap();
+  run(PROG.dyeInit, S.dye.write); S.dye.swap();
+}
+</script>
+<script>
+"use strict";
+/* ========================== one solver step ========================== */
+function step(dt){
+  S.dt = dt;
+  const k = pistonKinematics(S.t);
+  S.pistonX = k.x; S.pistonV = k.v;
+  S.firing = S.t < P.pushMs;
+
+  run(PROG.advectVel, S.vel.write, { uVel:S.vel.read.tex });                      S.vel.swap();
+  run(PROG.vort,      S.vort.write,{ uVel:S.vel.read.tex });                      S.vort.swap();
+  run(PROG.forces,    S.vel.write, { uVel:S.vel.read.tex, uVort:S.vort.read.tex });S.vel.swap();
+  run(PROG.solids,    S.vel.write, { uVel:S.vel.read.tex });                      S.vel.swap();
+  run(PROG.div,       S.div,       { uVel:S.vel.read.tex });
+  jacobiSweeps(P.iters);
+  run(PROG.proj,      S.vel.write, { uVel:S.vel.read.tex, uPres:S.pres.read.tex });S.vel.swap();
+  run(PROG.solids,    S.vel.write, { uVel:S.vel.read.tex });                      S.vel.swap();
+  run(PROG.dye,       S.dye.write, { uVel:S.vel.read.tex, uDye:S.dye.read.tex });  S.dye.swap();
+  S.t += dt;
+}
+
+/* The Jacobi loop dominates the frame, and at these grid sizes it is bound by GL call
+   overhead rather than fill rate — so hoist the uniform setup out and leave only the
+   texture bind, FBO bind and draw inside. */
+function jacobiSweeps(n){
+  const p = PROG.jacobi;
+  gl.useProgram(p);
+  setCommon(p);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, S.div.tex);
+  gl.uniform1i(loc(p,'uDivT'), 1);
+  gl.uniform1i(loc(p,'uPres'), 0);
+  gl.bindVertexArray(emptyVAO);
+  gl.viewport(0, 0, S.Nz, S.Nr);
+  gl.activeTexture(gl.TEXTURE0);
+  for (let i = 0; i < n; i++){
+    gl.bindTexture(gl.TEXTURE_2D, S.pres.read.tex);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, S.pres.write.fbo);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    S.pres.swap();
+  }
+}
+
+function chooseDt(){
+  const k  = pistonKinematics(S.t);
+  const ar = Math.pow(P.boreR / Math.max(P.exitR, 0.5), 2);
+  const vref = Math.max(S.vmax*1.2, Math.abs(k.v)*ar, 0.3);
+  return Math.min(0.5, P.cfl * Math.min(S.dz, S.dr) / vref);
+}
+
+/* ---- asynchronous GPU readback ----------------------------------------------
+   A plain readPixels costs ~10 ms of pipeline stall per call, which swamped the
+   0.15 ms solver step. Instead the result goes into a pixel-pack buffer and is
+   collected a frame or two later via a fence. ---------------------------------- */
+function makeReader(floats){
+  return { buf: gl.createBuffer(), sync: null, pending: false, tag: 0, waits: 0,
+           rect: null, fbo: null, data: new Float32Array(floats) };
+}
+function destroyReader(rd){
+  if (!rd) return;
+  if (rd.sync) gl.deleteSync(rd.sync);
+  gl.deleteBuffer(rd.buf);
+}
+function readerIssue(rd, fbo, x, y, w, h){
+  if (rd.pending) return;
+  rd.fbo = fbo; rd.rect = [x, y, w, h]; rd.waits = 0;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.bindBuffer(gl.PIXEL_PACK_BUFFER, rd.buf);
+  gl.bufferData(gl.PIXEL_PACK_BUFFER, rd.data.byteLength, gl.STREAM_READ);
+  gl.readPixels(x, y, w, h, gl.RGBA, gl.FLOAT, 0);
+  gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+  rd.sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+  rd.pending = true;
+}
+function readerFetch(rd){
+  gl.bindBuffer(gl.PIXEL_PACK_BUFFER, rd.buf);
+  gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, rd.data);
+  gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+  gl.deleteSync(rd.sync); rd.sync = null;
+  rd.pending = false;
+  return true;
+}
+function readerPoll(rd){
+  if (!rd.pending) return false;
+  // SYNC_FLUSH_COMMANDS_BIT is what actually pushes the fence towards being signalled;
+  // WebGL2 only permits a zero timeout here.
+  const st = gl.clientWaitSync(rd.sync, gl.SYNC_FLUSH_COMMANDS_BIT, 0);
+  if (st === gl.ALREADY_SIGNALED || st === gl.CONDITION_SATISFIED) return readerFetch(rd);
+  // Safety net: if fences are not making progress on this driver, take the stall rather
+  // than let the readouts freeze.
+  if (++rd.waits > 30){ gl.finish(); return readerFetch(rd); }
+  return false;
+}
+
+/* max |u| over the whole field, by log2 reduction on the GPU */
+function reduceRender(){
+  let src = S.vel.read.tex, sw = S.Nz+1, sh = S.Nr+1, first = 1;
+  for (const t of S.reduce){
+    run(PROG.reduce, t, { uSrc:src }, p => {
+      gl.uniform2i(loc(p,'uSrcSize'), sw, sh);
+      gl.uniform1i(loc(p,'uFirst'), first);
+    });
+    src = t.tex; sw = t.w; sh = t.h; first = 0;
+  }
+  return S.reduce[S.reduce.length - 1];
+}
+
+function probeIz(){
+  const zP = Math.min(S.Lz - S.dz, S.Z1 + P.plateT + P.probe);
+  return { zP, iz: Math.max(0, Math.min(S.Nz, Math.round(zP / S.dz))) };
+}
+
+/* ---- turn a probe-plane velocity profile into the headline numbers ---- */
+function consumeProbe(buf, t){
+  const axis = buf[1];
+  let mx = 0, Q = 0, mom = 0;
+  for (let ir = 0; ir < S.Nr; ir++){
+    const uz = buf[ir*4 + 1];
+    if (!Number.isFinite(uz)) continue;
+    if (Math.abs(uz) > Math.abs(mx)) mx = uz;
+    const rc = (ir + 0.5) * S.dr, dA = 2*Math.PI*rc*S.dr;
+    if (uz > 0){ Q += uz*dA; mom += uz*uz*dA; }
+  }
+  S.meas = { axis, mx, Q, mom };
+  if (mx > S.peak){ S.peak = mx; S.peakT = t; }
+  if (S.arrival < 0 && mx > 0.25) S.arrival = t;
+  S.series.push([t, axis, mx]);
+  if (S.series.length > 4000) S.series.splice(0, 2000);
+}
+
+/* ========================== rendering ========================== */
+function resizeCanvas(){
+  const wrap = document.getElementById('viewWrap');
+  const aspect = S.Lz / (2*S.Rmax);
+  let w = wrap.clientWidth - 2, h = wrap.clientHeight - 2;
+  if (w / h > aspect) w = h * aspect; else h = w / aspect;
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  canvas.style.width = w + 'px'; canvas.style.height = h + 'px';
+  canvas.width  = Math.max(2, Math.round(w * dpr));
+  canvas.height = Math.max(2, Math.round(h * dpr));
+}
+window.addEventListener('resize', () => { if (S.Nz) resizeCanvas(); });
+
+function render(){
+  const g = VIEW.gain;
+  let base;
+  switch (VIEW.field){
+    case 1: base = Math.max(S.vmax * 0.75, 1e-3); break;
+    case 2: base = Math.max(S.vmax / Math.min(S.dz, S.dr) * 0.12, 1e-3); break;
+    case 3: base = Math.max(S.vmax * S.vmax * 0.4, 1e-3); break;
+    case 4: base = Math.max(S.vmax * 0.75, 1e-3); break;
+    default: base = 1;
+  }
+  run(PROG.show, null,
+      { uVel:S.vel.read.tex, uDye:S.dye.read.tex, uVort:S.vort.read.tex, uPres:S.pres.read.tex },
+      p => {
+        gl.uniform2f(loc(p,'uViewport'), canvas.width, canvas.height);
+        gl.uniform1i(loc(p,'uField'), VIEW.field);
+        gl.uniform1f(loc(p,'uScale'), base / g);
+        gl.uniform1i(loc(p,'uShowGeom'), VIEW.showGeom ? 1 : 0);
+        gl.uniform1f(loc(p,'uProbeZ'), Math.min(S.Lz - S.dz, S.Z1 + P.plateT + P.probe));
+      });
+}
+
+/* ========================== derived design numbers ========================== */
+const MMS_TO_MS = 1;                       // 1 mm/ms == 1 m/s
+function derived(){
+  const Rb = P.boreR, re = Math.min(P.exitR, Rb - 0.25);
+  const Sd = Math.min(P.stroke, maxStroke());
+  const Vswept = Math.PI*Rb*Rb*Sd;                       // mm³
+  const Aex = Math.PI*re*re;
+  const Lslug = Vswept / Aex;
+  const LD = Lslug / (2*re);
+  const reOpt = Math.cbrt(Rb*Rb*Sd / 8);                 // L/D = 4
+  const vPiston = Math.PI*Sd / (2*P.pushMs);             // mm/ms = m/s
+  const vExit = vPiston * (Rb*Rb)/(re*re);
+  const mach = vExit / 343;
+  const Re = vExit * 2*re / Math.max(P.visc, 1e-9);
+  const gapFrac = P.pistonClr > 0 ? 1 - Math.pow((Rb - P.pistonClr)/Rb, 2) : 0;
+  return { Rb, re, Sd, Vswept, Lslug, LD, reOpt, vPiston, vExit, mach, Re, gapFrac };
+}
+
+const fmt = (x, d = 1) => (Number.isFinite(x) ? x.toFixed(d) : '—');
+function updateMetrics(){
+  const D = derived(), m = S.meas || { axis:0, mx:0, Q:0 };
+  const flags = [];
+  if (D.LD > 8)  flags.push(['bad', `Slug L/D = ${fmt(D.LD)}. A vortex ring pinches off at L/D ≈ 4 and everything after that is a trailing jet that stalls within a few diameters. This is the main reason a small orifice does not throw air further.`]);
+  else if (D.LD < 1.5) flags.push(['warn', `Slug L/D = ${fmt(D.LD,2)} — too short to roll up a ring. Longer stroke or smaller exit.`]);
+  else flags.push(['good', `Slug L/D = ${fmt(D.LD,2)} — in the ring-formation window (≈ 4 is optimum).`]);
+  if (D.mach > 0.3) flags.push(['bad', `Exit speed ${fmt(D.vExit)} m/s = Mach ${fmt(D.mach,2)}. The incompressible solver stops being valid here, and a real 3D-printed nozzle would choke and dump the energy as heat and noise.`]);
+  else if (D.mach > 0.15) flags.push(['warn', `Exit speed ${fmt(D.vExit)} m/s — compressibility starts to matter above ~100 m/s.`]);
+  if (D.gapFrac > 0.03) flags.push(['warn', `Piston clearance leaks ${fmt(D.gapFrac*100)}% of the bore area. Blow-by past the piston bypasses the muzzle entirely.`]);
+  if (P.stroke > maxStroke() + 0.5) flags.push(['warn', `Stroke clipped to ${fmt(D.Sd)} mm — the piston would hit the orifice plate.`]);
+
+  const rows = (title, list) => `<h4>${title}</h4>` + list.map(
+    ([k,v]) => `<div class="row"><span class="k">${k}</span><span class="v">${v}</span></div>`).join('');
+
+  document.getElementById('metrics').innerHTML =
+    rows('Design', [
+      ['swept volume',    fmt(D.Vswept/1000,1) + ' mL'],
+      ['exit / bore area',fmt((D.Rb*D.Rb)/(D.re*D.re),1) + ' : 1'],
+      ['slug length',     fmt(D.Lslug,0) + ' mm'],
+      ['slug L/D',        fmt(D.LD,2)],
+      ['exit R for L/D=4',fmt(D.reOpt,1) + ' mm'],
+      ['peak piston',     fmt(D.vPiston,2) + ' m/s'],
+      ['mean exit speed', fmt(D.vExit,1) + ' m/s (M ' + fmt(D.mach,2) + ')'],
+      ['exit Reynolds',   D.Re > 1e4 ? (D.Re/1000).toFixed(0)+'k' : fmt(D.Re,0)],
+    ]) + '<hr>' +
+    rows(`At target (${fmt(P.probe,0)} mm)`, [
+      ['on-axis u_z',   fmt(m.axis,2) + ' m/s'],
+      ['peak u_z now',  fmt(m.mx,2) + ' m/s'],
+      ['peak u_z ever', fmt(S.peak,2) + ' m/s' + (S.peak > 0.05 ? ` @ ${fmt(S.peakT,0)} ms` : '')],
+      ['arrival',       S.arrival >= 0 ? fmt(S.arrival,0) + ' ms' : 'not yet'],
+      ['volume flux',   fmt(m.Q,0) + ' mL/s'],
+    ]) +
+    flags.map(([c,t]) => `<div class="flag ${c}">${t}</div>`).join('');
+}
+
+/* ========================== time-series plot ========================== */
+const plot = document.getElementById('plot'), pctx = plot.getContext('2d');
+function drawPlot(){
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = plot.clientWidth, h = plot.clientHeight;
+  if (plot.width !== Math.round(w*dpr)){ plot.width = Math.round(w*dpr); plot.height = Math.round(h*dpr); }
+  pctx.setTransform(dpr,0,0,dpr,0,0);
+  pctx.clearRect(0,0,w,h);
+  document.getElementById('plotTitle').textContent =
+    `axial velocity at the target plane, ${fmt(P.probe,0)} mm downrange   —   ` +
+    `on-axis (cyan) and plane maximum (orange)`;
+
+  const ser = S.series;
+  if (ser.length < 2) return;
+  const t1 = Math.max(ser[ser.length-1][0], 1);
+  let vmaxP = 0.5;
+  for (const s of ser) vmaxP = Math.max(vmaxP, Math.abs(s[1]), Math.abs(s[2]));
+  const X = t => 34 + (w - 44) * (t / t1);
+  const Y = v => h - 16 - (h - 26) * (v / (vmaxP*1.08));
+
+  pctx.strokeStyle = '#2b3440'; pctx.lineWidth = 1;
+  pctx.beginPath(); pctx.moveTo(X(0), Y(0)); pctx.lineTo(X(t1), Y(0)); pctx.stroke();
+  pctx.fillStyle = '#8b97a6'; pctx.font = '10px ui-monospace, monospace';
+  pctx.fillText(fmt(vmaxP,1)+' m/s', 2, 12);
+  pctx.fillText('0', 22, Y(0)-2);
+  pctx.fillText(fmt(t1,0)+' ms', w-44, h-3);
+
+  for (const [idx, colr] of [[1,'#5ec6ff'], [2,'#ffb454']]){
+    pctx.strokeStyle = colr; pctx.lineWidth = 1.4; pctx.beginPath();
+    ser.forEach((s,i) => { const x = X(s[0]), y = Y(s[idx]); i ? pctx.lineTo(x,y) : pctx.moveTo(x,y); });
+    pctx.stroke();
+  }
+}
+</script>
+<script>
+"use strict";
+/* ========================== control panel ========================== */
+const host = document.getElementById('controls');
+const sliders = {};
+let pendingRebuild = false;
+
+function fmtVal(it, v){
+  const d = it.step >= 1 ? 0 : (it.step >= 0.1 ? 1 : (it.step >= 0.01 ? 2 : 4));
+  return v.toFixed(d) + (it.unit ? ' ' + it.unit : '');
+}
+
+function addControl(body, it){
+  const wrap = document.createElement('div');
+  wrap.className = 'ctl' + (it.rebuild ? ' rebuild' : '');
+  wrap.innerHTML =
+    `<div class="lab"><span>${it.t}</span><span id="v_${it.k}">${fmtVal(it, it.v)}</span></div>` +
+    `<input type="range" id="s_${it.k}" min="${it.min}" max="${it.max}" step="${it.step}" value="${it.v}">` +
+    (it.hint ? `<div class="hint">${it.hint}</div>` : '');
+  body.appendChild(wrap);
+  const inp = wrap.querySelector('input');
+  sliders[it.k] = { inp, out: wrap.querySelector('#v_' + it.k), it };
+  inp.addEventListener('input', () => {
+    P[it.k] = parseFloat(inp.value);
+    sliders[it.k].out.textContent = fmtVal(it, P[it.k]);
+    if (it.rebuild) pendingRebuild = true;
+    updateMetrics();
+  });
+}
+
+for (const g of CONTROLS){
+  const d = document.createElement('details');
+  if (g.open) d.open = true;
+  d.innerHTML = `<summary>${g.group}</summary><div class="body"></div>`;
+  const body = d.querySelector('.body');
+  for (const it of g.items) addControl(body, it);
+  host.appendChild(d);
+}
+
+/* ---- display section ---- */
+{
+  const d = document.createElement('details');
+  d.open = true;
+  d.innerHTML = `<summary>Display</summary><div class="body">
+    <div class="ctl"><div class="lab"><span>Field</span></div>
+      <select id="fieldSel">
+        <option value="0">Tracer (barrel air)</option>
+        <option value="1">Speed |u|</option>
+        <option value="2">Vorticity (ring cores)</option>
+        <option value="3">Pressure</option>
+        <option value="4">Axial velocity u_z</option>
+      </select></div>
+    <div class="ctl"><div class="lab"><span>Colour gain</span><span id="v_gain">1.0×</span></div>
+      <input type="range" id="s_gain" min="-1.2" max="1.5" step="0.02" value="0"></div>
+    <label class="chk"><input type="checkbox" id="geomChk" checked> Draw the hardware</label>
+  </div>`;
+  host.appendChild(d);
+  const gainOut = d.querySelector('#v_gain'), gainIn = d.querySelector('#s_gain');
+  VIEW.gain = 1;
+  gainIn.addEventListener('input', () => {
+    VIEW.gain = Math.pow(10, parseFloat(gainIn.value));
+    gainOut.textContent = VIEW.gain.toFixed(VIEW.gain < 1 ? 2 : 1) + '×';
+  });
+  d.querySelector('#fieldSel').addEventListener('change', e => VIEW.field = parseInt(e.target.value));
+  d.querySelector('#geomChk').addEventListener('change', e => VIEW.showGeom = e.target.checked);
+}
+
+/* ---- presets ---- */
+{
+  const d = document.createElement('details');
+  d.open = true;
+  d.innerHTML = `<summary>Presets</summary><div class="body"><div class="btnrow presets"></div></div>`;
+  const row = d.querySelector('.presets');
+  for (const pr of PRESETS){
+    const b = document.createElement('button');
+    b.innerHTML = `<b>${pr.n}</b><i>${pr.d}</i>`;
+    b.addEventListener('click', () => {
+      Object.assign(P, pr.p);
+      if (pr.auto === 'ld4')
+        P.exitR = Math.round(Math.cbrt(P.boreR*P.boreR*Math.min(P.stroke, maxStroke())/8) * 2) / 2;
+      syncSliders();
+      buildGrid(); updateMetrics();
+    });
+    row.appendChild(b);
+  }
+  host.appendChild(d);
+}
+
+function syncSliders(){
+  for (const k in sliders){
+    const s = sliders[k];
+    s.inp.value = P[k];
+    P[k] = parseFloat(s.inp.value);          // re-read so clamping to slider range applies
+    s.out.textContent = fmtVal(s.it, P[k]);
+  }
+}
+
+document.getElementById('note').innerHTML =
+  `<b>↻</b> marks parameters that rebuild the grid and restart the shot.<br>
+   Geometry comes from <code>airzooker.scad</code>. The flange and the handle greebles are outside
+   the flow and are not modelled; the barrel is treated as open at the back so air can refill
+   behind the piston.<br><br>
+   This is an <i>axisymmetric</i> solver: it resolves vortex <i>rings</i> correctly, which a plain
+   2D solver does not. It is still incompressible and under-resolved, so treat it as a way to
+   rank designs against each other rather than as an absolute predictor of range.`;
+
+/* ---- buttons & keys ---- */
+document.getElementById('fire').addEventListener('click', () => {
+  if (pendingRebuild){ buildGrid(); pendingRebuild = false; } else resetSim();
+  S.running = true; document.getElementById('pause').textContent = 'Pause';
+});
+document.getElementById('reset').addEventListener('click', () => { buildGrid(); pendingRebuild = false; });
+document.getElementById('pause').addEventListener('click', e => {
+  S.running = !S.running; e.target.textContent = S.running ? 'Pause' : 'Run';
+});
+window.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+  if (e.key === 'Enter'){ document.getElementById('fire').click(); e.preventDefault(); }
+  if (e.key === ' ')    { document.getElementById('pause').click(); e.preventDefault(); }
+});
+
+/* ========================== main loop ========================== */
+const hud = document.getElementById('hud');
+let lastWall = performance.now(), fps = 60;
+
+function frame(){
+  if (pendingRebuild && !S.running){ buildGrid(); pendingRebuild = false; }
+
+  if (S.running){
+    if (pendingRebuild){ buildGrid(); pendingRebuild = false; }
+    let simmed = 0;
+    for (let i = 0; i < P.spf; i++){ const dt = chooseDt(); step(dt); simmed += dt; }
+    S.frameDt = simmed;
+  }
+  if (readerPoll(S.rdMax) && Number.isFinite(S.rdMax.data[0]))
+    S.vmax = Math.max(S.rdMax.data[0], 0.05);
+  if (readerPoll(S.rdProbe)) consumeProbe(S.rdProbe.data, S.rdProbe.tag);
+  if (S.running){
+    readerIssue(S.rdMax, reduceRender().fbo, 0, 0, 1, 1);
+    S.rdProbe.tag = S.t;
+    readerIssue(S.rdProbe, S.vel.read.fbo, probeIz().iz, 0, 1, S.Nr + 1);
+  }
+  render();
+  drawPlot();
+  updateMetrics();
+
+  const now = performance.now();
+  fps += ((1000/Math.max(now - lastWall, 1)) - fps) * 0.1;
+  lastWall = now;
+  hud.textContent =
+    `t = ${S.t.toFixed(1)} ms   dt = ${(S.dt*1000).toFixed(1)} µs   ${S.frameDt.toFixed(2)} ms/frame` +
+    `   ${fps.toFixed(0)} fps\n` +
+    `piston  x = ${S.pistonX.toFixed(1)} mm   v = ${S.pistonV.toFixed(2)} m/s` +
+    (S.firing ? '   ▶ pushing' : '   ■ coasting') + `\n` +
+    `max |u| = ${S.vmax.toFixed(1)} m/s`;
+  document.getElementById('scalebar').textContent =
+    `domain ${S.Lz.toFixed(0)} × ${(2*S.Rmax).toFixed(0)} mm   grid ${S.Nz} × ${S.Nr}   ` +
+    `cell ${S.dz.toFixed(2)} × ${S.dr.toFixed(2)} mm`;
+
+  requestAnimationFrame(frame);
+}
+
+buildGrid();
+updateMetrics();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
