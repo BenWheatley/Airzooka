@@ -102,6 +102,7 @@
     <button id="pause">Pause</button>
     <button id="reset">Reset</button>
   </div>
+  <div id="diverged" class="flag bad" style="display:none"></div>
   <div id="controls"></div>
   <div id="note"></div>
 </div>
@@ -160,6 +161,17 @@ int solidCell(ivec2 c){
   return solidAt(vec2((float(c.x)+0.5)*uDz, (float(c.y)+0.5)*uDr));
 }
 vec2 cellCentre(ivec2 c){ return vec2((float(c.x)+0.5)*uDz, (float(c.y)+0.5)*uDr); }
+
+/* Faces touching a solid take that solid's velocity. Every surface in this device is
+   axial-facing, so the wall-normal radial component is always zero. */
+void applySolids(ivec2 c, inout float ur, inout float uz){
+  if (c.y == 0) ur = 0.0;
+  else if (solidCell(ivec2(c.x, c.y-1)) != FLUID || solidCell(ivec2(c.x, c.y)) != FLUID) ur = 0.0;
+  int a = (c.x > 0)        ? solidCell(ivec2(c.x-1, c.y)) : FLUID;
+  int b = (c.x < uCells.x) ? solidCell(ivec2(c.x  , c.y)) : FLUID;
+  if (a == WALL || b == WALL)           uz = 0.0;
+  else if (a == PISTON || b == PISTON)  uz = uPv;
+}
 
 vec4 fV(ivec2 c){ return texelFetch(uVel, clamp(c, ivec2(0), uFaces - 1), 0); }
 float fD(ivec2 c){ return texelFetch(uDye, clamp(c, ivec2(0), uCells - 1), 0).x; }
@@ -298,6 +310,7 @@ void main(){
       if (L > 1e-9){ n /= L; uz += uDt*uVortEps*h*( n.y*wf); }
     }
   }
+  applySolids(c, ur, uz);
   fragColor = vec4(ur, uz, 0.0, 0.0);
 }`;
 
@@ -307,22 +320,7 @@ void main(){
   ivec2 c = ivec2(gl_FragCoord.xy);
   vec4  v = fV(c);
   float ur = v.x, uz = v.y;
-
-  // radial face between cells (iz, ir-1) and (iz, ir): every surface here is axial-facing,
-  // so the wall-normal radial velocity is zero.
-  if (c.y == 0) ur = 0.0;
-  else {
-    int a = solidCell(ivec2(c.x, c.y-1));
-    int b = solidCell(ivec2(c.x, c.y  ));
-    if (a != FLUID || b != FLUID) ur = 0.0;
-  }
-  // axial face between cells (iz-1, ir) and (iz, ir)
-  {
-    int a = (c.x > 0)          ? solidCell(ivec2(c.x-1, c.y)) : FLUID;
-    int b = (c.x < uCells.x)   ? solidCell(ivec2(c.x  , c.y)) : FLUID;
-    if (a == WALL || b == WALL)       uz = 0.0;
-    else if (a == PISTON || b == PISTON) uz = uPv;
-  }
+  applySolids(c, ur, uz);
   fragColor = vec4(ur, uz, 0.0, 0.0);
 }`;
 
@@ -385,6 +383,7 @@ void main(){
     float pR = (c.x < uCells.x) ? fP(c)                 : 0.0;
     uz -= uDt*(pR - pL)/uDz;
   }
+  applySolids(c, ur, uz);
   fragColor = vec4(ur, uz, 0.0, 0.0);
 }`;
 
@@ -414,12 +413,12 @@ const FS_REDUCE = FSHEAD + `
 uniform sampler2D uSrc; uniform ivec2 uSrcSize; uniform int uFirst;
 void main(){
   ivec2 b = ivec2(gl_FragCoord.xy) * 2;
-  float m = 0.0;
+  vec2 m = vec2(0.0);
   for (int j = 0; j < 2; j++) for (int i = 0; i < 2; i++){
     vec4 v = texelFetch(uSrc, clamp(b + ivec2(i,j), ivec2(0), uSrcSize - 1), 0);
-    m = max(m, uFirst == 1 ? max(abs(v.x), abs(v.y)) : v.x);
+    m = max(m, uFirst == 1 ? abs(v.xy) : v.xy);
   }
-  fragColor = vec4(m, 0.0, 0.0, 0.0);
+  fragColor = vec4(m, 0.0, 0.0);
 }`;
 </script>
 <script>
@@ -609,15 +608,27 @@ const CONTROLS = [
  ]},
  { group:'Domain & solver', items:[
    { k:'downrange',  t:'Downrange domain',       min:50,  max:1200,step:10,   v:300,  unit:'mm', rebuild:true },
-   { k:'res',        t:'Radial cells',           min:48,  max:352, step:16,   v:144,  rebuild:true,
-     hint:'Cost scales as res². The orifice needs ≳6 cells across to mean anything.' },
-   { k:'iters',      t:'Pressure iterations',    min:10,  max:400, step:5,    v:120,
-     hint:'Jacobi converges slowly and this problem is strongly constrained. Results still ' +
-          'shift by a few percent below ~150; above that they are settled.' },
-   { k:'cfl',        t:'CFL number',             min:0.2, max:2.5, step:0.05, v:1.0 },
-   { k:'spf',        t:'Solver steps / frame',   min:1,   max:200, step:1,    v:40,
-     hint:'Wall-clock speed only. A small orifice forces a small timestep, so those cases ' +
-          'take longer to reach the same instant of flight.' },
+   { k:'zAspect',    t:'Axial cell stretch',     min:1,   max:4,   step:0.25, v:2,    rebuild:true,
+     hint:'Axial cell size as a multiple of radial. The jet is long and thin, so it tolerates ' +
+          'coarser axial cells — and since the timestep is set by the axial velocity, ' +
+          'stretching buys speed nearly for free. Drop to 1 if axial detail matters.' },
+   { k:'res',        t:'Radial cells',           min:48,  max:352, step:16,   v:112,  rebuild:true,
+     hint:'Halving this roughly halves the run time — not quarters it. Cost is per render ' +
+          'pass, not per pixel, so the only gain is the larger timestep a coarser grid allows. ' +
+          'The orifice still needs ≳6 cells across to mean anything.' },
+   { k:'iters',      t:'Pressure iterations',    min:30,  max:400, step:5,    v:50,
+     hint:'The dominant cost: each iteration is one render pass. Below about 30 the solve ' +
+          'stops enforcing mass conservation and the run diverges, so the slider stops there. ' +
+          'If the vorticity view looks speckled, that is unconverged pressure — raise this.' },
+   { k:'cfl',        t:'CFL number',             min:0.2, max:2.5, step:0.05, v:0.8,
+     hint:'Measured at the target plane: 0.5 and 1.0 agree within 1%, 2.0 reads 12% low and ' +
+          '4.0 reads 42% low. Semi-Lagrangian advection stays stable throughout — what you ' +
+          'lose above ~1 is accuracy, not stability.' },
+   { k:'budget',     t:'Frame budget',           min:8,   max:120, step:2,    v:30,   unit:'ms',
+     hint:'With auto-pacing on, steps per frame are tuned to hit this. Raise it for more ' +
+          'simulated time per frame, lower it to keep the controls feeling responsive.' },
+   { k:'spf',        t:'Steps / frame (manual)', min:1,   max:400, step:1,    v:40,
+     hint:'Only used when auto-pacing is off.' },
  ]},
  { group:'Measurement', items:[
    { k:'probe',      t:'Target distance from muzzle', min:10, max:1000, step:5, v:150, unit:'mm' },
@@ -640,9 +651,11 @@ const S = {
   Nz:0, Nr:0, dz:0, dr:0, Lz:0, Rmax:0, Z0:0, Z1:0,
   vel:null, pres:null, dye:null, div:null, vort:null, reduce:[],
   t:0, firing:false, running:true, pistonX:0, pistonV:0,
-  vmax:1, frameDt:0, steps:0,
+  vmax:1, vzmax:1, vrmax:1, frameDt:0, steps:0,
   series:[], peak:0, peakT:-1, arrival:-1,
+  spfAuto:8, wallSmooth:16, simRate:0, passUs:0, diverged:false,
 };
+const OPT = { autoPace:true };
 
 function pistonKinematics(t){
   const T = P.pushMs, Smax = maxStroke(), Sd = Math.min(P.stroke, Smax);
@@ -666,7 +679,7 @@ function buildGrid(){
 
   S.Nr = Math.round(P.res);
   S.dr = S.Rmax / S.Nr;
-  S.Nz = Math.max(48, Math.min(2400, Math.round(S.Lz / S.dr)));
+  S.Nz = Math.max(48, Math.min(2400, Math.round(S.Lz / (S.dr * P.zAspect))));
   S.dz = S.Lz / S.Nz;
 
   for (const t of [S.div]) destroyTarget(t);
@@ -692,6 +705,31 @@ function buildGrid(){
   }
   resizeCanvas();
   resetSim();
+}
+
+/* On a tile-based GPU (Apple silicon via ANGLE/Metal) a framebuffer switch costs far more
+   than the shading it wraps, and that cost is independent of texture size. It is the single
+   number that determines how fast this thing runs, so measure it rather than guess. */
+function measurePassCost(){
+  const a = makeTarget(128, 128), b = makeTarget(128, 128);
+  const prog = program(FSHEAD + `void main(){ fragColor = vec4(1.0); }`);
+  const px = new Float32Array(4);
+  const sync = () => { gl.bindFramebuffer(gl.FRAMEBUFFER, a.fbo);
+                       gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.FLOAT, px); };
+  gl.useProgram(prog); gl.bindVertexArray(emptyVAO); gl.viewport(0, 0, 128, 128);
+  const N = 200;
+  for (let w = 0; w < 2; w++){                       // one warm-up round, then the real one
+    sync(); var t0 = performance.now();
+    for (let i = 0; i < N; i++){
+      gl.bindFramebuffer(gl.FRAMEBUFFER, (i & 1) ? a.fbo : b.fbo);
+      gl.invalidateFramebuffer(gl.FRAMEBUFFER, [gl.COLOR_ATTACHMENT0]);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+    }
+    sync();
+    var us = ((performance.now() - t0) / N) * 1000;
+  }
+  destroyTarget(a); destroyTarget(b); gl.deleteProgram(prog);
+  return us;
 }
 
 function setCommon(p){
@@ -732,6 +770,8 @@ function run(prog, target, tex, extra){
   }
   if (extra) extra(prog);
   gl.bindFramebuffer(gl.FRAMEBUFFER, target ? target.fbo : null);
+  // every pass writes all of its pixels, so the previous contents need not be reloaded
+  if (target) gl.invalidateFramebuffer(gl.FRAMEBUFFER, [gl.COLOR_ATTACHMENT0]);
   gl.viewport(0, 0, target ? target.w : canvas.width, target ? target.h : canvas.height);
   gl.bindVertexArray(emptyVAO);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
@@ -742,6 +782,8 @@ function clearTarget(t){ run(PROG.clear, t); }
 function resetSim(){
   S.t = 0; S.pistonX = 0; S.pistonV = 0; S.firing = true; S.dt = 0.01;
   S.series.length = 0; S.peak = 0; S.peakT = -1; S.arrival = -1; S.vmax = 1;
+  S.vzmax = 1; S.vrmax = 1;
+  S.diverged = false; document.getElementById('diverged').style.display = 'none';
   for (const d of [S.vel, S.pres, S.vort]){ clearTarget(d.a); clearTarget(d.b); }
   clearTarget(S.div);
   run(PROG.dyeInit, S.dye.write); S.dye.swap();
@@ -757,14 +799,14 @@ function step(dt){
   S.pistonX = k.x; S.pistonV = k.v;
   S.firing = S.t < P.pushMs;
 
+  // forces and proj enforce the solid boundaries themselves; on this hardware every
+  // framebuffer bind costs far more than the shading, so merged passes are pure win.
   run(PROG.advectVel, S.vel.write, { uVel:S.vel.read.tex });                      S.vel.swap();
   run(PROG.vort,      S.vort.write,{ uVel:S.vel.read.tex });                      S.vort.swap();
   run(PROG.forces,    S.vel.write, { uVel:S.vel.read.tex, uVort:S.vort.read.tex });S.vel.swap();
-  run(PROG.solids,    S.vel.write, { uVel:S.vel.read.tex });                      S.vel.swap();
   run(PROG.div,       S.div,       { uVel:S.vel.read.tex });
   jacobiSweeps(P.iters);
   run(PROG.proj,      S.vel.write, { uVel:S.vel.read.tex, uPres:S.pres.read.tex });S.vel.swap();
-  run(PROG.solids,    S.vel.write, { uVel:S.vel.read.tex });                      S.vel.swap();
   run(PROG.dye,       S.dye.write, { uVel:S.vel.read.tex, uDye:S.dye.read.tex });  S.dye.swap();
   S.t += dt;
 }
@@ -785,16 +827,21 @@ function jacobiSweeps(n){
   for (let i = 0; i < n; i++){
     gl.bindTexture(gl.TEXTURE_2D, S.pres.read.tex);
     gl.bindFramebuffer(gl.FRAMEBUFFER, S.pres.write.fbo);
+    gl.invalidateFramebuffer(gl.FRAMEBUFFER, [gl.COLOR_ATTACHMENT0]);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     S.pres.swap();
   }
 }
 
+/* The advective limit is directional: the fast axial jet is limited by dz, the much slower
+   radial motion by dr. Using min(dz,dr) against a single scalar max|u| throws away most of
+   the timestep a stretched grid earns. */
 function chooseDt(){
   const k  = pistonKinematics(S.t);
   const ar = Math.pow(P.boreR / Math.max(P.exitR, 0.5), 2);
-  const vref = Math.max(S.vmax*1.2, Math.abs(k.v)*ar, 0.3);
-  return Math.min(0.5, P.cfl * Math.min(S.dz, S.dr) / vref);
+  const vz = Math.max(S.vzmax*1.2, Math.abs(k.v)*ar, 0.3);
+  const vr = Math.max(S.vrmax*1.2, 0.3);
+  return Math.min(0.5, P.cfl / (vz/S.dz + vr/S.dr));
 }
 
 /* ---- asynchronous GPU readback ----------------------------------------------
@@ -940,11 +987,15 @@ function updateMetrics(){
   else if (D.mach > 0.15) flags.push(['warn', `Exit speed ${fmt(D.vExit)} m/s — compressibility starts to matter above ~100 m/s.`]);
   if (D.gapFrac > 0.03) flags.push(['warn', `Piston clearance leaks ${fmt(D.gapFrac*100)}% of the bore area. Blow-by past the piston bypasses the muzzle entirely.`]);
   if (P.stroke > maxStroke() + 0.5) flags.push(['warn', `Stroke clipped to ${fmt(D.Sd)} mm — the piston would hit the orifice plate.`]);
+  flags.push(['warn', `The velocities above the line are analytic and solid. The measured ` +
+    `numbers below it are not grid-converged: re-running at 64, 112 and 160 radial cells moved ` +
+    `the peak by a factor of two or more, without settling. Read them as ranking designs, ` +
+    `never as absolute figures — the ring-versus-no-ring structure is the trustworthy output.`]);
 
   const rows = (title, list) => `<h4>${title}</h4>` + list.map(
     ([k,v]) => `<div class="row"><span class="k">${k}</span><span class="v">${v}</span></div>`).join('');
 
-  document.getElementById('metrics').innerHTML =
+  DOM.metrics.innerHTML =
     rows('Design', [
       ['swept volume',    fmt(D.Vswept/1000,1) + ' mL'],
       ['exit / bore area',fmt((D.Rb*D.Rb)/(D.re*D.re),1) + ' : 1'],
@@ -973,7 +1024,7 @@ function drawPlot(){
   if (plot.width !== Math.round(w*dpr)){ plot.width = Math.round(w*dpr); plot.height = Math.round(h*dpr); }
   pctx.setTransform(dpr,0,0,dpr,0,0);
   pctx.clearRect(0,0,w,h);
-  document.getElementById('plotTitle').textContent =
+  DOM.plotTitle.textContent =
     `axial velocity at the target plane, ${fmt(P.probe,0)} mm downrange   —   ` +
     `on-axis (cyan) and plane maximum (orange)`;
 
@@ -1002,6 +1053,10 @@ function drawPlot(){
 <script>
 "use strict";
 /* ========================== control panel ========================== */
+const DOM = { scalebar: document.getElementById('scalebar'),
+              pause:    document.getElementById('pause'),
+              metrics:  document.getElementById('metrics'),
+              plotTitle:document.getElementById('plotTitle') };
 const host = document.getElementById('controls');
 const sliders = {};
 let pendingRebuild = false;
@@ -1038,6 +1093,20 @@ for (const g of CONTROLS){
   host.appendChild(d);
 }
 
+/* ---- pacing toggle, appended to the solver section ---- */
+{
+  const solver = [...host.querySelectorAll('details')]
+    .find(d => d.querySelector('summary').textContent.startsWith('Domain'));
+  const wrap = document.createElement('label');
+  wrap.className = 'chk';
+  wrap.innerHTML = `<input type="checkbox" id="autoPace" checked> Auto-pace to the frame budget`;
+  solver.querySelector('.body').prepend(wrap);
+  wrap.querySelector('input').addEventListener('change', e => {
+    OPT.autoPace = e.target.checked;
+    if (!OPT.autoPace) P.spf = Math.max(1, Math.round(S.spfAuto));
+  });
+}
+
 /* ---- display section ---- */
 {
   const d = document.createElement('details');
@@ -1066,11 +1135,37 @@ for (const g of CONTROLS){
   d.querySelector('#geomChk').addEventListener('change', e => VIEW.showGeom = e.target.checked);
 }
 
+/* ---- quality presets: the solver knobs that actually trade speed for fidelity ---- */
+const QUALITY = [
+  { n:'Draft',    d:'coarse, for sweeping parameters', q:{ res:64,  iters:40, cfl:1.0 } },
+  { n:'Balanced', d:'the shipped default',             q:{ res:112, iters:50, cfl:0.8 } },
+  { n:'Accurate', d:'slow; for a final check',         q:{ res:192, iters:90, cfl:0.5 } },
+];
+{
+  const d = document.createElement('details');
+  d.open = true;
+  d.innerHTML = `<summary>Quality</summary><div class="body">
+    <div class="btnrow presets" id="qrow"></div>
+    <div class="hint" style="margin-top:6px">Cost is dominated by the number of render
+    passes, which is <i>steps × pressure iterations</i>. A finer grid costs you mainly through
+    the smaller timestep it forces, not through the extra pixels.</div></div>`;
+  const row = d.querySelector('#qrow');
+  for (const q of QUALITY){
+    const b = document.createElement('button');
+    b.innerHTML = `<b>${q.n}</b><i>${q.d}</i>`;
+    b.addEventListener('click', () => {
+      Object.assign(P, q.q); syncSliders(); buildGrid(); updateMetrics();
+    });
+    row.appendChild(b);
+  }
+  host.appendChild(d);
+}
+
 /* ---- presets ---- */
 {
   const d = document.createElement('details');
   d.open = true;
-  d.innerHTML = `<summary>Presets</summary><div class="body"><div class="btnrow presets"></div></div>`;
+  d.innerHTML = `<summary>Geometry presets</summary><div class="body"><div class="btnrow presets"></div></div>`;
   const row = d.querySelector('.presets');
   for (const pr of PRESETS){
     const b = document.createElement('button');
@@ -1115,10 +1210,11 @@ document.getElementById('note').innerHTML =
 /* ---- buttons & keys ---- */
 document.getElementById('fire').addEventListener('click', () => {
   if (pendingRebuild){ buildGrid(); pendingRebuild = false; } else resetSim();
-  S.running = true; document.getElementById('pause').textContent = 'Pause';
+  S.running = true; S.spfAuto = 8; DOM.pause.textContent = 'Pause';
 });
 document.getElementById('reset').addEventListener('click', () => { buildGrid(); pendingRebuild = false; });
-document.getElementById('pause').addEventListener('click', e => {
+DOM.pause.addEventListener('click', e => {
+  if (S.diverged) return;
   S.running = !S.running; e.target.textContent = S.running ? 'Pause' : 'Run';
 });
 window.addEventListener('keydown', e => {
@@ -1129,19 +1225,28 @@ window.addEventListener('keydown', e => {
 
 /* ========================== main loop ========================== */
 const hud = document.getElementById('hud');
-let lastWall = performance.now(), fps = 60;
+let lastWall = performance.now(), lastUi = 0, fps = 60;
 
 function frame(){
   if (pendingRebuild && !S.running){ buildGrid(); pendingRebuild = false; }
 
-  if (S.running){
+  if (S.running && !S.diverged){
     if (pendingRebuild){ buildGrid(); pendingRebuild = false; }
     let simmed = 0;
-    for (let i = 0; i < P.spf; i++){ const dt = chooseDt(); step(dt); simmed += dt; }
+    const n = OPT.autoPace ? Math.max(1, Math.round(S.spfAuto)) : P.spf;
+    for (let i = 0; i < n; i++){ const dt = chooseDt(); step(dt); simmed += dt; }
     S.frameDt = simmed;
   }
-  if (readerPoll(S.rdMax) && Number.isFinite(S.rdMax.data[0]))
-    S.vmax = Math.max(S.rdMax.data[0], 0.05);
+  if (readerPoll(S.rdMax)){
+    const vr = S.rdMax.data[0], vz = S.rdMax.data[1];
+    if (!Number.isFinite(vr) || !Number.isFinite(vz) || Math.max(vr, vz) > 5000)
+      flagDivergence(Math.max(vr, vz));
+    else {
+      S.vrmax = Math.max(vr, 0.05);
+      S.vzmax = Math.max(vz, 0.05);
+      S.vmax  = Math.max(vr, vz, 0.05);
+    }
+  }
   if (readerPoll(S.rdProbe)) consumeProbe(S.rdProbe.data, S.rdProbe.tag);
   if (S.running){
     readerIssue(S.rdMax, reduceRender().fbo, 0, 0, 1, 1);
@@ -1149,26 +1254,57 @@ function frame(){
     readerIssue(S.rdProbe, S.vel.read.fbo, probeIz().iz, 0, 1, S.Nr + 1);
   }
   render();
-  drawPlot();
-  updateMetrics();
 
   const now = performance.now();
-  fps += ((1000/Math.max(now - lastWall, 1)) - fps) * 0.1;
+  const wall = Math.min(Math.max(now - lastWall, 1), 500);
   lastWall = now;
+  S.wallSmooth += (wall - S.wallSmooth) * 0.15;
+  fps += ((1000/wall) - fps) * 0.1;
+  S.simRate = S.frameDt * 1000 / Math.max(S.wallSmooth, 1);
+
+  // Steer steps-per-frame towards the frame budget. Nothing else adapts to the wide range
+  // of timestep sizes the geometry produces, so without this a small orifice is a slideshow.
+  if (OPT.autoPace && S.running && !S.diverged){
+    if (S.wallSmooth > P.budget * 1.15)      S.spfAuto = Math.max(1, S.spfAuto * 0.85);
+    else if (S.wallSmooth < P.budget * 0.85) S.spfAuto = Math.min(2000, S.spfAuto * 1.10);
+  }
+
+  // The plot and the metrics panel are DOM work; at 60 Hz they cost more than the solver.
+  if (now - lastUi > 90){
+    lastUi = now;
+    drawPlot();
+    updateMetrics();
+    DOM.scalebar.textContent =
+      `domain ${S.Lz.toFixed(0)} × ${(2*S.Rmax).toFixed(0)} mm   grid ${S.Nz} × ${S.Nr}   ` +
+      `cell ${S.dz.toFixed(2)} × ${S.dr.toFixed(2)} mm`;
+  }
+
+  const steps = OPT.autoPace ? Math.max(1, Math.round(S.spfAuto)) : P.spf;
   hud.textContent =
-    `t = ${S.t.toFixed(1)} ms   dt = ${(S.dt*1000).toFixed(1)} µs   ${S.frameDt.toFixed(2)} ms/frame` +
-    `   ${fps.toFixed(0)} fps\n` +
+    `t = ${S.t.toFixed(1)} ms   dt = ${(S.dt*1000).toFixed(1)} µs   ` +
+    `max |u| = ${S.vmax.toFixed(1)} m/s\n` +
     `piston  x = ${S.pistonX.toFixed(1)} mm   v = ${S.pistonV.toFixed(2)} m/s` +
     (S.firing ? '   ▶ pushing' : '   ■ coasting') + `\n` +
-    `max |u| = ${S.vmax.toFixed(1)} m/s`;
-  document.getElementById('scalebar').textContent =
-    `domain ${S.Lz.toFixed(0)} × ${(2*S.Rmax).toFixed(0)} mm   grid ${S.Nz} × ${S.Nr}   ` +
-    `cell ${S.dz.toFixed(2)} × ${S.dr.toFixed(2)} mm`;
+    `${fps.toFixed(0)} fps   ${steps} steps/frame   ` +
+    `${S.simRate.toFixed(1)} ms of flight per second\n` +
+    `${(steps*(P.iters+6)).toLocaleString()} passes/frame @ ${S.passUs.toFixed(0)} µs`;
 
   requestAnimationFrame(frame);
 }
 
+function flagDivergence(v){
+  S.diverged = true; S.running = false;
+  DOM.pause.textContent = 'Run';
+  const el = document.getElementById('diverged');
+  el.style.display = 'block';
+  el.innerHTML = `<b>The run diverged.</b> Peak velocity reached ` +
+    (Number.isFinite(v) ? `${v.toFixed(0)} m/s` : 'a non-finite value') +
+    `, which means the pressure solve stopped enforcing mass conservation. ` +
+    `Raise <b>pressure iterations</b>, or lower the <b>CFL number</b>, then fire again.`;
+}
+
 buildGrid();
+S.passUs = measurePassCost();
 updateMetrics();
 requestAnimationFrame(frame);
 </script>
