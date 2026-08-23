@@ -615,7 +615,9 @@ const CONTROLS = [
      hint:'Jacobi converges slowly and this problem is strongly constrained. Results still ' +
           'shift by a few percent below ~150; above that they are settled.' },
    { k:'cfl',        t:'CFL number',             min:0.2, max:2.5, step:0.05, v:1.0 },
-   { k:'spf',        t:'Solver steps / frame',   min:1,   max:200, step:1,    v:20 },
+   { k:'spf',        t:'Solver steps / frame',   min:1,   max:200, step:1,    v:40,
+     hint:'Wall-clock speed only. A small orifice forces a small timestep, so those cases ' +
+          'take longer to reach the same instant of flight.' },
  ]},
  { group:'Measurement', items:[
    { k:'probe',      t:'Target distance from muzzle', min:10, max:1000, step:5, v:150, unit:'mm' },
@@ -1095,13 +1097,20 @@ function syncSliders(){
 }
 
 document.getElementById('note').innerHTML =
-  `<b>↻</b> marks parameters that rebuild the grid and restart the shot.<br>
-   Geometry comes from <code>airzooker.scad</code>. The flange and the handle greebles are outside
+  `<b>↻</b> marks parameters that rebuild the grid and restart the shot.
+   <b>Enter</b> fires, <b>space</b> pauses.<br><br>
+   Geometry comes from <code>airzooker.scad</code>. The flange and the handle greebles sit outside
    the flow and are not modelled; the barrel is treated as open at the back so air can refill
    behind the piston.<br><br>
-   This is an <i>axisymmetric</i> solver: it resolves vortex <i>rings</i> correctly, which a plain
-   2D solver does not. It is still incompressible and under-resolved, so treat it as a way to
-   rank designs against each other rather than as an absolute predictor of range.`;
+   <b>What to trust.</b> This is an <i>axisymmetric</i> solver, so it forms and propagates vortex
+   <i>rings</i> properly — a plain planar 2D solver gives vortex pairs that behave quite
+   differently. Ring formation, pinch-off and the L/D physics are the parts worth believing.<br><br>
+   <b>What not to trust.</b> Absolute range is optimistic. A real jet breaks up through 3-D
+   instabilities that circular symmetry forbids by construction, so without help the jet here
+   stays laminar and flies too far. The Smagorinsky term is a stand-in for that missing mixing,
+   not a substitute for it. The solver is also incompressible, so any design whose exit speed
+   approaches Mach 0.3 is outside what it can model. Use it to rank designs against each other,
+   not to predict metres.`;
 
 /* ---- buttons & keys ---- */
 document.getElementById('fire').addEventListener('click', () => {
