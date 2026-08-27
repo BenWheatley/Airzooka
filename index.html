@@ -21,7 +21,7 @@
   #viewWrap{flex:1 1 auto; position:relative; min-height:0; background:#05070a;
             border:1px solid var(--line); border-radius:8px; overflow:hidden;
             display:flex; align-items:center; justify-content:center}
-  #view{display:block; max-width:100%; max-height:100%; image-rendering:auto}
+  #view,#viewgpu{display:block; max-width:100%; max-height:100%; image-rendering:auto}
   #hud{position:absolute; left:10px; top:8px; font:11px/1.4 var(--mono); color:#9fb2c4;
        text-shadow:0 1px 3px #000; pointer-events:none; white-space:pre}
   #scalebar{position:absolute; right:10px; bottom:8px; font:11px var(--mono); color:#9fb2c4;
@@ -82,6 +82,7 @@
 <div id="stage">
   <div id="viewWrap">
     <canvas id="view"></canvas>
+    <canvas id="viewgpu" style="display:none"></canvas>
     <div id="hud"></div>
     <div id="scalebar"></div>
   </div>
@@ -703,6 +704,7 @@ function buildGrid(){
     w = Math.max(1, Math.ceil(w/2)); h = Math.max(1, Math.ceil(h/2));
     S.reduce.push(makeTarget(w, h, gl.RGBA32F, gl.RGBA));
   }
+  if (WG.ok) wgpuAlloc();
   resizeCanvas();
   resetSim();
 }
@@ -784,6 +786,7 @@ function resetSim(){
   S.series.length = 0; S.peak = 0; S.peakT = -1; S.arrival = -1; S.vmax = 1;
   S.vzmax = 1; S.vrmax = 1;
   S.diverged = false; document.getElementById('diverged').style.display = 'none';
+  if (WG.ok){ wgpuReset(); return; }
   for (const d of [S.vel, S.pres, S.vort]){ clearTarget(d.a); clearTarget(d.b); }
   clearTarget(S.div);
   run(PROG.dyeInit, S.dye.write); S.dye.swap();
@@ -931,13 +934,15 @@ function resizeCanvas(){
   let w = wrap.clientWidth - 2, h = wrap.clientHeight - 2;
   if (w / h > aspect) w = h * aspect; else h = w / aspect;
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
-  canvas.style.width = w + 'px'; canvas.style.height = h + 'px';
-  canvas.width  = Math.max(2, Math.round(w * dpr));
-  canvas.height = Math.max(2, Math.round(h * dpr));
+  const cv = WG.ok ? WG.canvas : canvas;
+  cv.style.width = w + 'px'; cv.style.height = h + 'px';
+  cv.width  = Math.max(2, Math.round(w * dpr));
+  cv.height = Math.max(2, Math.round(h * dpr));
 }
 window.addEventListener('resize', () => { if (S.Nz) resizeCanvas(); });
 
 function render(){
+  if (WG.ok){ wgpuRender(); return; }
   const g = VIEW.gain;
   let base;
   switch (VIEW.field){
@@ -1050,6 +1055,847 @@ function drawPlot(){
   }
 }
 </script>
+<script>
+"use strict";
+/* ==========================================================================
+   WebGPU compute backend.
+   The WebGL2 path runs every kernel as a fragment shader, so each one is a
+   draw into a framebuffer and pays ~65 us of render-pass setup against ~4 us
+   of actual shading. Compute dispatches pay none of that, and workgroup
+   shared memory lets one dispatch carry several Jacobi iterations instead of
+   one -- which is where the pressure solve's cost actually goes.
+   ========================================================================== */
+
+const WG = {
+  ok:false, dev:null, ctx:null, fmt:null, canvas:null,
+};
+
+const WGSL_PARAMS = `
+struct Params {
+  cells : vec2<i32>,          // Nz, Nr
+  faces : vec2<i32>,          // Nz+1, Nr+1
+  d     : vec2<f32>,          // dz, dr
+  dtlz  : vec2<f32>,          // dt, Lz
+  geoA  : vec4<f32>,          // rmax, z0, z1, boreR
+  geoB  : vec4<f32>,          // wallT, exitR, plateT, taper
+  pist  : vec4<f32>,          // pz0, pz1, pr, pv
+  flu   : vec4<f32>,          // visc, vortEps, dyeDiss, smag
+  misc  : vec4<f32>,          // seed, probeIz, _, _
+};
+@group(0) @binding(0) var<uniform> P : Params;
+`;
+
+/* The compute kernels need nine storage buffers; the display fragment shader needs four,
+   read-only. Splitting the declarations keeps each stage under its per-stage limit, and
+   a fragment shader may not bind a read_write storage buffer at all. */
+const WGSL_DECLS_C = `
+@group(1) @binding(0) var<storage, read>       velS : array<vec2<f32>>;
+@group(1) @binding(1) var<storage, read_write> velD : array<vec2<f32>>;
+@group(1) @binding(2) var<storage, read>       preS : array<f32>;
+@group(1) @binding(3) var<storage, read_write> preD : array<f32>;
+@group(1) @binding(4) var<storage, read_write> divB : array<f32>;
+@group(1) @binding(5) var<storage, read_write> vorB : array<f32>;
+@group(1) @binding(6) var<storage, read>       dyeS : array<f32>;
+@group(1) @binding(7) var<storage, read_write> dyeD : array<f32>;
+@group(1) @binding(8) var<storage, read_write> probeB : array<f32>;
+@group(1) @binding(9) var<storage, read_write> coefB : array<vec4<f32>>;
+`;
+const WGSL_DECLS_S = `
+@group(1) @binding(0) var<storage, read> velS : array<vec2<f32>>;
+@group(1) @binding(1) var<storage, read> preS : array<f32>;
+@group(1) @binding(2) var<storage, read> vorB : array<f32>;
+@group(1) @binding(3) var<storage, read> dyeS : array<f32>;
+`;
+const WGSL_HELPERS = `
+const FLUID : i32 = 0;
+const WALL  : i32 = 1;
+const PISTON: i32 = 2;
+
+fn solidAt(p : vec2<f32>) -> i32 {
+  let z = p.x; let r = p.y;
+  if (z >= P.pist.x && z <= P.pist.y && r <= P.pist.z) { return PISTON; }
+  let outR = P.geoA.w + P.geoB.x;
+  if (z >= P.geoA.y && z <= P.geoA.z + P.geoB.z && r <= outR) {
+    var rin : f32;
+    let taper = P.geoB.w; let z1 = P.geoA.z;
+    if (z <= z1 - taper) { rin = P.geoA.w; }
+    else if (z <= z1) {
+      if (taper > 0.0) { rin = mix(P.geoA.w, P.geoB.y, (z - (z1 - taper)) / taper); }
+      else { rin = P.geoA.w; }
+    } else { rin = P.geoB.y; }
+    if (r >= rin) { return WALL; }
+  }
+  return FLUID;
+}
+fn solidCell(iz : i32, ir : i32) -> i32 {
+  return solidAt(vec2<f32>((f32(iz) + 0.5) * P.d.x, (f32(ir) + 0.5) * P.d.y));
+}
+fn cellCentre(iz : i32, ir : i32) -> vec2<f32> {
+  return vec2<f32>((f32(iz) + 0.5) * P.d.x, (f32(ir) + 0.5) * P.d.y);
+}
+fn iF(iz : i32, ir : i32) -> u32 {            // clamped index into a face array
+  let z = clamp(iz, 0, P.faces.x - 1);
+  let r = clamp(ir, 0, P.faces.y - 1);
+  return u32(r * P.faces.x + z);
+}
+fn iC(iz : i32, ir : i32) -> u32 {            // clamped index into a cell array
+  let z = clamp(iz, 0, P.cells.x - 1);
+  let r = clamp(ir, 0, P.cells.y - 1);
+  return u32(r * P.cells.x + z);
+}
+fn fV(iz : i32, ir : i32) -> vec2<f32> { return velS[iF(iz, ir)]; }
+fn fW(iz : i32, ir : i32) -> f32       { return vorB[iF(iz, ir)]; }
+fn fD(iz : i32, ir : i32) -> f32       { return dyeS[iC(iz, ir)]; }
+fn fP(iz : i32, ir : i32) -> f32       { return preS[iC(iz, ir)]; }
+
+fn sampleUr(p : vec2<f32>) -> f32 {
+  let f  = vec2<f32>(p.x / P.d.x - 0.5, p.y / P.d.y);
+  let fl = floor(f); let i = vec2<i32>(fl); let s = f - fl;
+  return mix(mix(fV(i.x, i.y).x, fV(i.x + 1, i.y).x, s.x),
+             mix(fV(i.x, i.y + 1).x, fV(i.x + 1, i.y + 1).x, s.x), s.y);
+}
+fn sampleUz(p : vec2<f32>) -> f32 {
+  let f  = vec2<f32>(p.x / P.d.x, p.y / P.d.y - 0.5);
+  let fl = floor(f); let i = vec2<i32>(fl); let s = f - fl;
+  return mix(mix(fV(i.x, i.y).y, fV(i.x + 1, i.y).y, s.x),
+             mix(fV(i.x, i.y + 1).y, fV(i.x + 1, i.y + 1).y, s.x), s.y);
+}
+fn sampleDye(p : vec2<f32>) -> f32 {
+  let f  = vec2<f32>(p.x / P.d.x - 0.5, p.y / P.d.y - 0.5);
+  let fl = floor(f); let i = vec2<i32>(fl); let s = f - fl;
+  return mix(mix(fD(i.x, i.y), fD(i.x + 1, i.y), s.x),
+             mix(fD(i.x, i.y + 1), fD(i.x + 1, i.y + 1), s.x), s.y);
+}
+fn velAt(p : vec2<f32>) -> vec2<f32> { return vec2<f32>(sampleUz(p), sampleUr(p)); }
+fn backtrace(p : vec2<f32>) -> vec2<f32> {
+  let dt = P.dtlz.x;
+  let pm = p - 0.5 * dt * velAt(p);
+  let pb = p - dt * velAt(pm);
+  return clamp(pb, vec2<f32>(0.0), vec2<f32>(P.dtlz.y, P.geoA.x));
+}
+fn applySolids(iz : i32, ir : i32, ur : ptr<function, f32>, uz : ptr<function, f32>) {
+  if (ir == 0) { *ur = 0.0; }
+  else if (solidCell(iz, ir - 1) != FLUID || solidCell(iz, ir) != FLUID) { *ur = 0.0; }
+  var a = FLUID; var b = FLUID;
+  if (iz > 0)            { a = solidCell(iz - 1, ir); }
+  if (iz < P.cells.x)    { b = solidCell(iz, ir); }
+  if (a == WALL || b == WALL) { *uz = 0.0; }
+  else if (a == PISTON || b == PISTON) { *uz = P.pist.w; }
+}
+`;
+
+const WGSL_KERNELS = WGSL_PARAMS + WGSL_DECLS_C + WGSL_HELPERS + `
+@compute @workgroup_size(8, 8)
+fn advectVel(@builtin(global_invocation_id) g : vec3<u32>) {
+  let iz = i32(g.x); let ir = i32(g.y);
+  if (iz >= P.faces.x || ir >= P.faces.y) { return; }
+  var nur = 0.0; var nuz = 0.0;
+  if (ir > 0 && iz < P.cells.x) {
+    nur = sampleUr(backtrace(vec2<f32>((f32(iz) + 0.5) * P.d.x, f32(ir) * P.d.y)));
+  }
+  if (ir < P.cells.y) {
+    nuz = sampleUz(backtrace(vec2<f32>(f32(iz) * P.d.x, (f32(ir) + 0.5) * P.d.y)));
+  }
+  velD[iF(iz, ir)] = vec2<f32>(nur, nuz);
+}
+
+@compute @workgroup_size(8, 8)
+fn vorticity(@builtin(global_invocation_id) g : vec3<u32>) {
+  let iz = i32(g.x); let ir = i32(g.y);
+  if (iz >= P.faces.x || ir >= P.faces.y) { return; }
+  let dur_dz = (fV(iz, ir).x - fV(iz - 1, ir).x) / P.d.x;
+  let duz_dr = (fV(iz, ir).y - fV(iz, ir - 1).y) / P.d.y;
+  vorB[iF(iz, ir)] = dur_dz - duz_dr;
+}
+
+fn eddyVisc(iz : i32, ir : i32) -> f32 {
+  if (P.flu.w <= 0.0) { return 0.0; }
+  let dz = P.d.x; let dr = P.d.y;
+  let rc = (f32(ir) + 0.5) * dr;
+  let durdr = (fV(iz, ir + 1).x - fV(iz, ir).x) / dr;
+  let duzdz = (fV(iz + 1, ir).y - fV(iz, ir).y) / dz;
+  let urc   = 0.5 * (fV(iz, ir).x + fV(iz, ir + 1).x);
+  let stt   = urc / max(rc, 1e-6);
+  let durdz = 0.25 * ((fV(iz + 1, ir).x - fV(iz - 1, ir).x)
+                    + (fV(iz + 1, ir + 1).x - fV(iz - 1, ir + 1).x)) / dz;
+  let duzdr = 0.25 * ((fV(iz, ir + 1).y - fV(iz, ir - 1).y)
+                    + (fV(iz + 1, ir + 1).y - fV(iz + 1, ir - 1).y)) / dr;
+  let srz = 0.5 * (durdz + duzdr);
+  let s2  = 2.0 * (durdr * durdr + duzdz * duzdz + stt * stt) + 4.0 * srz * srz;
+  let dd  = sqrt(dr * dz);
+  return P.flu.w * P.flu.w * dd * dd * sqrt(max(s2, 0.0));
+}
+
+@compute @workgroup_size(8, 8)
+fn forces(@builtin(global_invocation_id) g : vec3<u32>) {
+  let iz = i32(g.x); let ir = i32(g.y);
+  if (iz >= P.faces.x || ir >= P.faces.y) { return; }
+  let v = fV(iz, ir);
+  var ur = v.x; var uz = v.y;
+  let dz = P.d.x; let dr = P.d.y;
+  let dr2 = dr * dr; let dz2 = dz * dz;
+  let dt = P.dtlz.x;
+  var nu = P.flu.x + eddyVisc(clamp(iz, 0, P.cells.x - 1), clamp(ir, 0, P.cells.y - 1));
+  nu = min(nu, 0.25 * min(dr2, dz2) / max(dt, 1e-9));
+
+  if (ir > 0) {
+    let rf = f32(ir) * dr;
+    let rp = rf + 0.5 * dr; let rm = rf - 0.5 * dr;
+    let lap = (rp * (fV(iz, ir + 1).x - ur) - rm * (ur - fV(iz, ir - 1).x)) / (rf * dr2)
+            - ur / (rf * rf)
+            + (fV(iz + 1, ir).x - 2.0 * ur + fV(iz - 1, ir).x) / dz2;
+    ur = ur + dt * nu * lap;
+  } else { ur = 0.0; }
+  {
+    let rc = (f32(ir) + 0.5) * dr;
+    let rp = f32(ir + 1) * dr; let rm = f32(ir) * dr;
+    let lap = (rp * (fV(iz, ir + 1).y - uz) - rm * (uz - fV(iz, ir - 1).y)) / (rc * dr2)
+            + (fV(iz + 1, ir).y - 2.0 * uz + fV(iz - 1, ir).y) / dz2;
+    uz = uz + dt * nu * lap;
+  }
+  if (P.flu.y > 0.0) {
+    let h = 0.5 * (dr + dz);
+    let eps = P.flu.y;
+    if (ir > 0) {
+      let wf = 0.5 * (fW(iz, ir) + fW(iz + 1, ir));
+      let gz = (abs(fW(iz + 1, ir)) - abs(fW(iz, ir))) / dz;
+      let gr = 0.25 * ((abs(fW(iz, ir + 1)) + abs(fW(iz + 1, ir + 1)))
+                     - (abs(fW(iz, ir - 1)) + abs(fW(iz + 1, ir - 1)))) / dr;
+      let n = vec2<f32>(gz, gr); let L = length(n);
+      if (L > 1e-9) { ur = ur + dt * eps * h * (-(n.x / L) * wf); }
+    }
+    {
+      let wf = 0.5 * (fW(iz, ir) + fW(iz, ir + 1));
+      let gr = (abs(fW(iz, ir + 1)) - abs(fW(iz, ir))) / dr;
+      let gz = 0.25 * ((abs(fW(iz + 1, ir)) + abs(fW(iz + 1, ir + 1)))
+                     - (abs(fW(iz - 1, ir)) + abs(fW(iz - 1, ir + 1)))) / dz;
+      let n = vec2<f32>(gz, gr); let L = length(n);
+      if (L > 1e-9) { uz = uz + dt * eps * h * ((n.y / L) * wf); }
+    }
+  }
+  applySolids(iz, ir, &ur, &uz);
+  velD[iF(iz, ir)] = vec2<f32>(ur, uz);
+}
+
+@compute @workgroup_size(8, 8)
+fn divergence(@builtin(global_invocation_id) g : vec3<u32>) {
+  let iz = i32(g.x); let ir = i32(g.y);
+  if (iz >= P.cells.x || ir >= P.cells.y) { return; }
+  if (solidCell(iz, ir) != FLUID) { divB[iC(iz, ir)] = 0.0; return; }
+  let dr = P.d.y; let dz = P.d.x;
+  let rc = (f32(ir) + 0.5) * dr;
+  let rm = f32(ir) * dr; let rp = f32(ir + 1) * dr;
+  let d = (rp * fV(iz, ir + 1).x - rm * fV(iz, ir).x) / (rc * dr)
+        + (fV(iz + 1, ir).y - fV(iz, ir).y) / dz;
+  divB[iC(iz, ir)] = d;
+}
+
+@compute @workgroup_size(8, 8)
+fn project(@builtin(global_invocation_id) g : vec3<u32>) {
+  let iz = i32(g.x); let ir = i32(g.y);
+  if (iz >= P.faces.x || ir >= P.faces.y) { return; }
+  let v = fV(iz, ir);
+  var ur = v.x; var uz = v.y;
+  let dt = P.dtlz.x;
+  if (ir > 0 && ir <= P.cells.y && iz < P.cells.x) {
+    let pIn = fP(iz, ir - 1);
+    var pOut = 0.0;
+    if (ir < P.cells.y) { pOut = fP(iz, ir); }
+    ur = ur - dt * (pOut - pIn) / P.d.y;
+  } else { ur = 0.0; }
+  if (ir < P.cells.y) {
+    var pL = 0.0; var pR = 0.0;
+    if (iz > 0)         { pL = fP(iz - 1, ir); }
+    if (iz < P.cells.x) { pR = fP(iz, ir); }
+    uz = uz - dt * (pR - pL) / P.d.x;
+  }
+  applySolids(iz, ir, &ur, &uz);
+  velD[iF(iz, ir)] = vec2<f32>(ur, uz);
+}
+
+@compute @workgroup_size(8, 8)
+fn advectDye(@builtin(global_invocation_id) g : vec3<u32>) {
+  let iz = i32(g.x); let ir = i32(g.y);
+  if (iz >= P.cells.x || ir >= P.cells.y) { return; }
+  let p = cellCentre(iz, ir);
+  if (solidAt(p) != FLUID) { dyeD[iC(iz, ir)] = 0.0; return; }
+  var d = sampleDye(backtrace(p)) * exp(-P.flu.z * P.dtlz.x);
+  if (i32(P.misc.x) == 1 && p.y <= P.pist.z && p.x >= P.pist.y && p.x <= P.pist.y + 3.0) {
+    d = 1.0;
+  }
+  dyeD[iC(iz, ir)] = clamp(d, 0.0, 1.0);
+}
+
+@compute @workgroup_size(8, 8)
+fn dyeInit(@builtin(global_invocation_id) g : vec3<u32>) {
+  let iz = i32(g.x); let ir = i32(g.y);
+  if (iz >= P.cells.x || ir >= P.cells.y) { return; }
+  let p = cellCentre(iz, ir);
+  let inBarrel = solidAt(p) == FLUID && p.x > P.geoA.y && p.x < P.geoA.z + P.geoB.z
+                 && p.y < P.geoA.w;
+  var v = 0.0;
+  if (inBarrel) { v = 1.0; }
+  dyeD[iC(iz, ir)] = v;
+}
+
+@compute @workgroup_size(8, 8)
+fn clearAll(@builtin(global_invocation_id) g : vec3<u32>) {
+  let iz = i32(g.x); let ir = i32(g.y);
+  if (iz < P.faces.x && ir < P.faces.y) {
+    velD[iF(iz, ir)] = vec2<f32>(0.0);
+    vorB[iF(iz, ir)] = 0.0;
+  }
+  if (iz < P.cells.x && ir < P.cells.y) {
+    preD[iC(iz, ir)] = 0.0;
+    divB[iC(iz, ir)] = 0.0;
+  }
+}
+
+/* Everything the Jacobi sweep needs about geometry and boundaries, folded once per step
+   into four coefficients and a scaled right-hand side. The inner loop then costs one dot
+   product instead of five solidAt evaluations, which is where the time actually went.
+   divB is rewritten in place: it arrives as divergence and leaves as rhs/den. */
+@compute @workgroup_size(8, 8)
+fn prepare(@builtin(global_invocation_id) g : vec3<u32>) {
+  let iz = i32(g.x); let ir = i32(g.y);
+  if (iz >= P.cells.x || ir >= P.cells.y) { return; }
+  let k = iC(iz, ir);
+  if (solidCell(iz, ir) != FLUID) {
+    coefB[k] = vec4<f32>(0.0); divB[k] = 0.0; return;
+  }
+  let nz = P.cells.x; let nr = P.cells.y;
+  let dz = P.d.x; let dr = P.d.y;
+  let rc = (f32(ir) + 0.5) * dr;
+  let aM = (f32(ir) * dr) / (rc * dr * dr);
+  let aP = (f32(ir + 1) * dr) / (rc * dr * dr);
+  let b  = 1.0 / (dz * dz);
+  var cW = 0.0; var cE = 0.0; var cS = 0.0; var cN = 0.0; var den = 0.0;
+  if (ir > 0) {
+    if (solidCell(iz, ir - 1) == FLUID) { cS = aM; den = den + aM; }
+  }
+  if (ir < nr - 1) {
+    if (solidCell(iz, ir + 1) == FLUID) { cN = aP; den = den + aP; }
+  } else { den = den + aP; }
+  if (iz > 0) {
+    if (solidCell(iz - 1, ir) == FLUID) { cW = b; den = den + b; }
+  } else { den = den + b; }
+  if (iz < nz - 1) {
+    if (solidCell(iz + 1, ir) == FLUID) { cE = b; den = den + b; }
+  } else { den = den + b; }
+  var inv = 0.0;
+  if (den > 1e-12) { inv = 1.0 / den; }
+  coefB[k] = vec4<f32>(cW, cE, cS, cN) * inv;
+  divB[k]  = (divB[k] / P.dtlz.x) * inv;
+}
+
+/* One Jacobi iteration per dispatch, straight out of global memory.
+   A shared-memory version carrying four iterations per dispatch was tried and measured
+   1.69x SLOWER (17.1 vs 10.1 us per iteration): a compute dispatch costs only ~4 us here,
+   so there is nothing to amortise, and the halo makes the workgroup do 2.25x the cells.
+   This kernel is memory-bandwidth bound, which is the right place to be. */
+@compute @workgroup_size(64, 1)
+fn jacobiSimple(@builtin(global_invocation_id) g : vec3<u32>) {
+  let iz = i32(g.x); let ir = i32(g.y);
+  if (iz >= P.cells.x || ir >= P.cells.y) { return; }
+  let nz = P.cells.x; let nr = P.cells.y;
+  let k = u32(ir * nz + iz);
+  let pW = preS[u32(ir * nz + max(iz - 1, 0))];
+  let pE = preS[u32(ir * nz + min(iz + 1, nz - 1))];
+  let pS = preS[u32(max(ir - 1, 0) * nz + iz)];
+  let pN = preS[u32(min(ir + 1, nr - 1) * nz + iz)];
+  preD[k] = dot(coefB[k], vec4<f32>(pW, pE, pS, pN)) - divB[k];
+}
+
+@compute @workgroup_size(64)
+fn probeGather(@builtin(global_invocation_id) g : vec3<u32>) {
+  let ir = i32(g.x);
+  if (ir >= P.faces.y) { return; }
+  probeB[u32(ir)] = fV(i32(P.misc.y), ir).y;
+}
+`;
+
+/* ---- max |u_r|, |u_z| by workgroup reduction; two dispatches instead of ten ---- */
+const WGSL_REDUCE = `
+struct RP { n : u32, first : u32, _a : u32, _b : u32 };
+@group(0) @binding(0) var<uniform> R : RP;
+@group(1) @binding(0) var<storage, read>       src : array<vec2<f32>>;
+@group(1) @binding(1) var<storage, read_write> dst : array<vec2<f32>>;
+
+var<workgroup> sh : array<vec2<f32>, 256>;
+
+@compute @workgroup_size(256)
+fn reduceMax(@builtin(global_invocation_id) g : vec3<u32>,
+             @builtin(local_invocation_index) tid : u32,
+             @builtin(workgroup_id) wid : vec3<u32>) {
+  var v = vec2<f32>(0.0);
+  if (g.x < R.n) {
+    v = src[g.x];
+    if (R.first == 1u) { v = abs(v); }
+  }
+  sh[tid] = v;
+  workgroupBarrier();
+  var s = 128u;
+  loop {
+    if (s == 0u) { break; }
+    if (tid < s) { sh[tid] = max(sh[tid], sh[tid + s]); }
+    workgroupBarrier();
+    s = s >> 1u;
+  }
+  if (tid == 0u) { dst[wid.x] = sh[0]; }
+}
+`;
+
+/* ---- display: one full-screen triangle, fragment reads the storage buffers ---- */
+const WGSL_SHOW = WGSL_PARAMS + WGSL_DECLS_S + WGSL_HELPERS + `
+struct Show {
+  viewport : vec2<f32>,
+  field    : f32,
+  scale    : f32,
+  showGeom : f32,
+  probeZ   : f32,
+  _pad     : vec2<f32>,
+};
+@group(2) @binding(0) var<uniform> SH : Show;
+
+@vertex
+fn vs(@builtin(vertex_index) vi : u32) -> @builtin(position) vec4<f32> {
+  let v = vec2<f32>(f32((vi << 1u) & 2u), f32(vi & 2u));
+  return vec4<f32>(v * 2.0 - 1.0, 0.0, 1.0);
+}
+
+fn viridis(t0 : f32) -> vec3<f32> {
+  let t = clamp(t0, 0.0, 1.0);
+  let c0 = vec3<f32>(0.2777, 0.0054, 0.3341);
+  let c1 = vec3<f32>(0.1051, 1.4046, 1.3846);
+  let c2 = vec3<f32>(-0.3309, 0.2148, 0.0951);
+  let c3 = vec3<f32>(-4.6342, -5.7991, -19.3324);
+  let c4 = vec3<f32>(6.2283, 14.1799, 56.6906);
+  let c5 = vec3<f32>(4.7764, -13.7451, -65.3530);
+  let c6 = vec3<f32>(-5.4355, 4.6459, 26.3124);
+  return clamp(c0 + t * (c1 + t * (c2 + t * (c3 + t * (c4 + t * (c5 + t * c6))))),
+               vec3<f32>(0.0), vec3<f32>(1.0));
+}
+fn diverging(t : f32) -> vec3<f32> {
+  let a = clamp(abs(t), 0.0, 1.0);
+  var c = vec3<f32>(1.0, 0.42, 0.25);
+  if (t < 0.0) { c = vec3<f32>(0.25, 0.55, 1.0); }
+  return mix(vec3<f32>(0.055, 0.07, 0.09), c, pow(a, 0.75));
+}
+
+@fragment
+fn fs(@builtin(position) fc : vec4<f32>) -> @location(0) vec4<f32> {
+  let uv = vec2<f32>(fc.x / SH.viewport.x, 1.0 - fc.y / SH.viewport.y);
+  let z  = uv.x * P.dtlz.y;
+  let rs = (uv.y - 0.5) * 2.0 * P.geoA.x;
+  let r  = abs(rs);
+  let p  = vec2<f32>(z, r);
+  let iz = clamp(i32(floor(z / P.d.x)), 0, P.cells.x - 1);
+  let ir = clamp(i32(floor(r / P.d.y)), 0, P.cells.y - 1);
+
+  var col = vec3<f32>(0.055, 0.07, 0.09);
+  let sld = solidAt(p);
+  let fld = i32(SH.field);
+
+  if (sld == FLUID) {
+    let uzc = 0.5 * (fV(iz, ir).y + fV(iz + 1, ir).y);
+    let urc = 0.5 * (fV(iz, ir).x + fV(iz, ir + 1).x);
+    if (fld == 0) {
+      let d = clamp(sampleDye(p), 0.0, 1.0);
+      col = mix(col, vec3<f32>(0.86, 0.93, 1.0), pow(d, 0.7));
+    } else if (fld == 1) {
+      col = viridis(length(vec2<f32>(uzc, urc)) / max(SH.scale, 1e-6));
+    } else if (fld == 2) {
+      let w = 0.25 * (fW(iz, ir) + fW(iz + 1, ir) + fW(iz, ir + 1) + fW(iz + 1, ir + 1));
+      var sgn = 1.0;
+      if ((uv.y - 0.5) < 0.0) { sgn = -1.0; }
+      col = diverging(clamp(sgn * w / max(SH.scale, 1e-6), -1.0, 1.0));
+    } else if (fld == 3) {
+      col = diverging(clamp(fP(iz, ir) / max(SH.scale, 1e-6), -1.0, 1.0));
+    } else {
+      col = diverging(clamp(uzc / max(SH.scale, 1e-6), -1.0, 1.0));
+    }
+    if (fld != 0) { col = mix(col, vec3<f32>(1.0), 0.16 * clamp(sampleDye(p), 0.0, 1.0)); }
+  } else if (SH.showGeom > 0.5) {
+    if (sld == PISTON) { col = vec3<f32>(0.83, 0.55, 0.20); }
+    else { col = vec3<f32>(0.30, 0.35, 0.42); }
+    if (fract((z * 0.5 + r * 0.5) / 3.0) < 0.5) { col = col + 0.04; }
+  } else {
+    col = vec3<f32>(0.10, 0.11, 0.13);
+  }
+  if (abs(uv.y - 0.5) * SH.viewport.y < 0.6) { col = mix(col, vec3<f32>(0.45, 0.55, 0.65), 0.5); }
+  if (abs(z - SH.probeZ) < P.d.x * 0.6) { col = mix(col, vec3<f32>(1.0, 0.85, 0.35), 0.45); }
+  return vec4<f32>(col, 1.0);
+}
+`;
+
+/* ========================== device, buffers, pipelines ========================== */
+const PARAM_STRIDE = 256;                 // uniform dynamic-offset alignment
+const PARAM_FLOATS = PARAM_STRIDE / 4;
+
+async function wgpuInit(){
+  if (!navigator.gpu) return false;
+  let ad, dev;
+  try {
+    ad = await navigator.gpu.requestAdapter({ powerPreference:'high-performance' });
+    if (!ad) return false;
+    const want = Math.min(10, ad.limits.maxStorageBuffersPerShaderStage || 8);
+    dev = await ad.requestDevice({ requiredLimits:{ maxStorageBuffersPerShaderStage: want } });
+  } catch (e){ return false; }
+  WG.dev = dev;
+  WG.canvas = document.getElementById('viewgpu');
+  WG.ctx = WG.canvas.getContext('webgpu');
+  if (!WG.ctx) return false;
+  WG.fmt = navigator.gpu.getPreferredCanvasFormat();
+  WG.ctx.configure({ device: dev, format: WG.fmt, alphaMode:'opaque' });
+
+  dev.onuncapturederror = e => {
+    console.error('WebGPU', e.error);
+    if (!WG.failed){ WG.failed = true; wgpuFail(e.error && e.error.message || 'device error'); }
+  };
+
+  const modK = dev.createShaderModule({ code: WGSL_KERNELS });
+  const modR = dev.createShaderModule({ code: WGSL_REDUCE });
+  const modS = dev.createShaderModule({ code: WGSL_SHOW });
+  for (const m of [modK, modR, modS]){
+    const info = await m.getCompilationInfo();
+    const bad = info.messages.filter(x => x.type === 'error');
+    if (bad.length){ console.error(bad); wgpuFail(bad[0].message); return false; }
+  }
+
+  // ---- bind group layouts ----
+  const uni = (dyn) => ({ binding:0, visibility:GPUShaderStage.COMPUTE | GPUShaderStage.FRAGMENT,
+                          buffer:{ type:'uniform', hasDynamicOffset:!!dyn } });
+  WG.bglP = dev.createBindGroupLayout({ entries:[uni(true)] });
+  const st = (b, ro) => ({ binding:b, visibility:GPUShaderStage.COMPUTE,
+                           buffer:{ type: ro ? 'read-only-storage' : 'storage' } });
+  WG.bglF = dev.createBindGroupLayout({ entries:[
+    st(0,true), st(1,false), st(2,true), st(3,false), st(4,false),
+    st(5,false), st(6,true), st(7,false), st(8,false), st(9,false) ] });
+  const sr = b => ({ binding:b, visibility:GPUShaderStage.FRAGMENT,
+                     buffer:{ type:'read-only-storage' } });
+  WG.bglFS = dev.createBindGroupLayout({ entries:[ sr(0), sr(1), sr(2), sr(3) ] });
+  WG.bglS = dev.createBindGroupLayout({ entries:[
+    { binding:0, visibility:GPUShaderStage.FRAGMENT, buffer:{ type:'uniform' } } ] });
+  WG.bglRP = dev.createBindGroupLayout({ entries:[
+    { binding:0, visibility:GPUShaderStage.COMPUTE, buffer:{ type:'uniform', hasDynamicOffset:true } } ] });
+  WG.bglR = dev.createBindGroupLayout({ entries:[
+    { binding:0, visibility:GPUShaderStage.COMPUTE, buffer:{ type:'read-only-storage' } },
+    { binding:1, visibility:GPUShaderStage.COMPUTE, buffer:{ type:'storage' } } ] });
+
+  const plK = dev.createPipelineLayout({ bindGroupLayouts:[WG.bglP, WG.bglF] });
+  const plR = dev.createPipelineLayout({ bindGroupLayouts:[WG.bglRP, WG.bglR] });
+  const plS = dev.createPipelineLayout({ bindGroupLayouts:[WG.bglP, WG.bglFS, WG.bglS] });
+
+  WG.pipe = {};
+  for (const name of ['advectVel','vorticity','forces','divergence','project',
+                      'advectDye','dyeInit','clearAll','probeGather','prepare','jacobiSimple'])
+    WG.pipe[name] = dev.createComputePipeline({ layout:plK, compute:{ module:modK, entryPoint:name } });
+  WG.pipe.reduceMax = dev.createComputePipeline({ layout:plR, compute:{ module:modR, entryPoint:'reduceMax' } });
+  WG.pipe.show = dev.createRenderPipeline({
+    layout: plS,
+    vertex:   { module:modS, entryPoint:'vs' },
+    fragment: { module:modS, entryPoint:'fs', targets:[{ format:WG.fmt }] },
+    primitive:{ topology:'triangle-list' } });
+
+  WG.ok = true;
+  return true;
+}
+
+function wgpuFail(msg){
+  WG.ok = false;
+  const el = document.getElementById('diverged');
+  if (el){ el.style.display='block';
+    el.innerHTML = `<b>WebGPU failed, fell back to WebGL2.</b> ${msg}`; }
+}
+
+function wgpuAlloc(){
+  const dev = WG.dev, B = WG.buf || (WG.buf = {});
+  for (const k in B) if (B[k] && B[k].destroy) B[k].destroy();
+  WG.buf = {};
+  const nF = (S.Nz + 1) * (S.Nr + 1), nC = S.Nz * S.Nr;
+  const SU = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
+  const mk = (n, bytes) => dev.createBuffer({ size: Math.max(16, n * bytes), usage: SU });
+  const B2 = WG.buf;
+  B2.velA = mk(nF, 8); B2.velB = mk(nF, 8);
+  B2.preA = mk(nC, 4); B2.preB = mk(nC, 4);
+  B2.div  = mk(nC, 4); B2.vor  = mk(nF, 4);
+  B2.dyeA = mk(nC, 4); B2.dyeB = mk(nC, 4);
+  B2.probe = mk(S.Nr + 1, 4);
+  B2.coef  = mk(nC, 16);
+
+  WG.nSteps = 0;
+  B2.params = dev.createBuffer({ size: PARAM_STRIDE * 2048,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  WG.paramHost = new ArrayBuffer(PARAM_STRIDE * 2048);
+  WG.paramF = new Float32Array(WG.paramHost);
+  WG.paramI = new Int32Array(WG.paramHost);
+
+  // one field bind group per (vel, pres, dye) parity
+  WG.bgF = [];
+  for (let m = 0; m < 8; m++){
+    const v = (m & 4) ? 1 : 0, q = (m & 2) ? 1 : 0, y = (m & 1) ? 1 : 0;
+    WG.bgF.push(dev.createBindGroup({ layout:WG.bglF, entries:[
+      { binding:0, resource:{ buffer: v ? B2.velB : B2.velA } },
+      { binding:1, resource:{ buffer: v ? B2.velA : B2.velB } },
+      { binding:2, resource:{ buffer: q ? B2.preB : B2.preA } },
+      { binding:3, resource:{ buffer: q ? B2.preA : B2.preB } },
+      { binding:4, resource:{ buffer: B2.div } },
+      { binding:5, resource:{ buffer: B2.vor } },
+      { binding:6, resource:{ buffer: y ? B2.dyeB : B2.dyeA } },
+      { binding:7, resource:{ buffer: y ? B2.dyeA : B2.dyeB } },
+      { binding:8, resource:{ buffer: B2.probe } },
+      { binding:9, resource:{ buffer: B2.coef } } ]}));
+  }
+  WG.bgFS = [];
+  for (let m = 0; m < 8; m++){
+    const v = (m & 4) ? 1 : 0, q = (m & 2) ? 1 : 0, y = (m & 1) ? 1 : 0;
+    WG.bgFS.push(dev.createBindGroup({ layout:WG.bglFS, entries:[
+      { binding:0, resource:{ buffer: v ? B2.velB : B2.velA } },
+      { binding:1, resource:{ buffer: q ? B2.preB : B2.preA } },
+      { binding:2, resource:{ buffer: B2.vor } },
+      { binding:3, resource:{ buffer: y ? B2.dyeB : B2.dyeA } } ]}));
+  }
+  WG.bgP = dev.createBindGroup({ layout:WG.bglP, entries:[
+    { binding:0, resource:{ buffer:B2.params, size:112 } }] });
+
+  // reduction chain
+  B2.showU = dev.createBuffer({ size:32, usage:GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  WG.bgS = dev.createBindGroup({ layout:WG.bglS, entries:[{ binding:0, resource:{ buffer:B2.showU }}] });
+
+  WG.redLevels = [];
+  let n = nF, lvl = 0, srcBuf = B2.velA, srcBufAlt = B2.velB;
+  const redParams = [];
+  while (n > 1){
+    const outN = Math.ceil(n / 256);
+    const out = mk(outN, 8);
+    WG.redLevels.push({ n, outN, out });
+    redParams.push(n, lvl === 0 ? 1 : 0, 0, 0);
+    n = outN; lvl++;
+  }
+  B2.redParams = dev.createBuffer({ size: PARAM_STRIDE * Math.max(1, WG.redLevels.length),
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const rp = new Uint32Array(PARAM_STRIDE * Math.max(1, WG.redLevels.length) / 4);
+  WG.redLevels.forEach((L, i) => { rp[i * PARAM_FLOATS] = L.n; rp[i * PARAM_FLOATS + 1] = i === 0 ? 1 : 0; });
+  dev.queue.writeBuffer(B2.redParams, 0, rp);
+  WG.bgRP = dev.createBindGroup({ layout:WG.bglRP, entries:[
+    { binding:0, resource:{ buffer:B2.redParams, size:16 }}] });
+
+  // reduce bind groups: level 0 has two variants (velA / velB), rest are fixed
+  WG.bgRed = WG.redLevels.map((L, i) => {
+    if (i === 0) return [
+      dev.createBindGroup({ layout:WG.bglR, entries:[
+        { binding:0, resource:{ buffer:B2.velA }}, { binding:1, resource:{ buffer:L.out }}]}),
+      dev.createBindGroup({ layout:WG.bglR, entries:[
+        { binding:0, resource:{ buffer:B2.velB }}, { binding:1, resource:{ buffer:L.out }}]})];
+    return [dev.createBindGroup({ layout:WG.bglR, entries:[
+      { binding:0, resource:{ buffer:WG.redLevels[i-1].out }}, { binding:1, resource:{ buffer:L.out }}]})];
+  });
+
+  // staging buffers for readback
+  WG.stageMax   = dev.createBuffer({ size:8,  usage:GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  WG.stageProbe = dev.createBuffer({ size:Math.max(16,(S.Nr+1)*4),
+    usage:GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  WG.mapBusy = false;
+  WG.gen = (WG.gen || 0) + 1;      // invalidates readbacks still in flight from the old grid
+  WG.velPar = 0; WG.prePar = 0; WG.dyePar = 0;
+}
+
+/* ---- pack one step's uniforms into slot `slot` of the dynamic-offset buffer ---- */
+function wgpuParams(slot, dt){
+  const F = WG.paramF, I = WG.paramI, o = slot * PARAM_FLOATS;
+  I[o+0] = S.Nz;      I[o+1] = S.Nr;
+  I[o+2] = S.Nz + 1;  I[o+3] = S.Nr + 1;
+  F[o+4] = S.dz;      F[o+5] = S.dr;
+  F[o+6] = dt;        F[o+7] = S.Lz;
+  F[o+8] = S.Rmax;    F[o+9] = S.Z0;  F[o+10] = S.Z1;   F[o+11] = P.boreR;
+  F[o+12]= P.wallT;   F[o+13]= Math.min(P.exitR, P.boreR);
+  F[o+14]= P.plateT;  F[o+15]= Math.min(P.taper, P.barrelLen - 2);
+  const pz0 = pistonBackStart() + S.pistonX;
+  F[o+16]= pz0;       F[o+17]= pz0 + P.pistonT;
+  F[o+18]= Math.max(0.1, P.boreR - P.pistonClr);
+  F[o+19]= S.pistonV;
+  F[o+20]= P.visc;    F[o+21]= P.vortEps; F[o+22]= P.dyeDiss; F[o+23]= P.smag;
+  F[o+24]= S.firing ? 1 : 0;
+  F[o+25]= probeIz().iz;
+}
+
+const wgDispatch = (pass, pipe, nx, ny, wx, wy) => {
+  pass.setPipeline(pipe);
+  pass.dispatchWorkgroups(Math.ceil(nx / wx), Math.ceil(ny / wy));
+};
+
+/* ---- every step of the frame goes into one command encoder, submitted once ---- */
+function wgpuSteps(n){
+  const dev = WG.dev, B = WG.buf;
+  const maxSlots = 2048;
+  n = Math.min(n, maxSlots);
+
+  // decide every timestep up front so the uniforms can be uploaded in one go
+  const dts = [];
+  let tSim = S.t, simmed = 0;
+  const savedT = S.t, savedX = S.pistonX, savedV = S.pistonV, savedF = S.firing;
+  for (let i = 0; i < n; i++){
+    S.t = tSim;
+    const k = pistonKinematics(tSim);
+    S.pistonX = k.x; S.pistonV = k.v; S.firing = tSim < P.pushMs;
+    const dt = chooseDt();
+    wgpuParams(i, dt);
+    dts.push(dt); tSim += dt; simmed += dt;
+  }
+  S.t = savedT; S.pistonX = savedX; S.pistonV = savedV; S.firing = savedF;
+  dev.queue.writeBuffer(B.params, 0, WG.paramHost, 0, n * PARAM_STRIDE);
+
+  const nF = (S.Nz + 1), nFr = (S.Nr + 1);
+  const nJx = Math.ceil(S.Nz / 64);
+
+  const enc = dev.createCommandEncoder();
+  const pass = enc.beginComputePass();
+  for (let i = 0; i < n; i++){
+    const off = [i * PARAM_STRIDE];
+    const bg = () => WG.bgF[(WG.velPar ? 4 : 0) | (WG.prePar ? 2 : 0) | (WG.dyePar ? 1 : 0)];
+    pass.setBindGroup(0, WG.bgP, off);
+
+    pass.setBindGroup(1, bg()); wgDispatch(pass, WG.pipe.advectVel, nF, nFr, 8, 8); WG.velPar ^= 1;
+    pass.setBindGroup(1, bg()); wgDispatch(pass, WG.pipe.vorticity, nF, nFr, 8, 8);
+    pass.setBindGroup(1, bg()); wgDispatch(pass, WG.pipe.forces,    nF, nFr, 8, 8); WG.velPar ^= 1;
+    pass.setBindGroup(1, bg()); wgDispatch(pass, WG.pipe.divergence, S.Nz, S.Nr, 8, 8);
+    pass.setBindGroup(1, bg()); wgDispatch(pass, WG.pipe.prepare,    S.Nz, S.Nr, 8, 8);
+    for (let j = 0; j < P.iters; j++){
+      pass.setBindGroup(1, bg());
+      pass.setPipeline(WG.pipe.jacobiSimple);
+      pass.dispatchWorkgroups(nJx, S.Nr);
+      WG.prePar ^= 1;
+    }
+    pass.setBindGroup(1, bg()); wgDispatch(pass, WG.pipe.project, nF, nFr, 8, 8); WG.velPar ^= 1;
+    pass.setBindGroup(1, bg()); wgDispatch(pass, WG.pipe.advectDye, S.Nz, S.Nr, 8, 8); WG.dyePar ^= 1;
+  }
+
+  // max |u| reduction + probe column, on the final state
+  pass.setBindGroup(0, WG.bgP, [(n - 1) * PARAM_STRIDE]);
+  pass.setBindGroup(1, WG.bgF[(WG.velPar ? 4 : 0) | (WG.prePar ? 2 : 0) | (WG.dyePar ? 1 : 0)]);
+  pass.setPipeline(WG.pipe.probeGather);
+  pass.dispatchWorkgroups(Math.ceil((S.Nr + 1) / 64));
+
+  pass.setPipeline(WG.pipe.reduceMax);
+  WG.redLevels.forEach((L, i) => {
+    pass.setBindGroup(0, WG.bgRP, [i * PARAM_STRIDE]);
+    pass.setBindGroup(1, WG.bgRed[i][i === 0 ? WG.velPar : 0]);
+    pass.dispatchWorkgroups(Math.ceil(L.n / 256));
+  });
+  pass.end();
+
+  const last = WG.redLevels[WG.redLevels.length - 1];
+  // Capture the staging buffers and the grid generation now: a rebuild may swap both out
+  // before this readback resolves, and unmapping the wrong buffer corrupts the next submit.
+  const sMax = WG.stageMax, sProbe = WG.stageProbe, gen = WG.gen, nr = S.Nr;
+  if (!WG.mapBusy){
+    enc.copyBufferToBuffer(last.out, 0, sMax, 0, 8);
+    enc.copyBufferToBuffer(WG.buf.probe, 0, sProbe, 0, (nr + 1) * 4);
+  }
+  dev.queue.submit([enc.finish()]);
+
+  if (!WG.mapBusy){
+    WG.mapBusy = true;
+    const tag = S.t + simmed;
+    Promise.all([sMax.mapAsync(GPUMapMode.READ),
+                 sProbe.mapAsync(GPUMapMode.READ)]).then(() => {
+      const m  = new Float32Array(sMax.getMappedRange().slice(0));
+      const pr = new Float32Array(sProbe.getMappedRange().slice(0));
+      sMax.unmap(); sProbe.unmap();
+      if (gen !== WG.gen) return;            // stale sample from a grid that no longer exists
+      WG.mapBusy = false;
+      if (!Number.isFinite(m[0]) || !Number.isFinite(m[1]) || Math.max(m[0], m[1]) > 5000){
+        flagDivergence(Math.max(m[0], m[1]));
+      } else {
+        S.vrmax = Math.max(m[0], 0.05);
+        S.vzmax = Math.max(m[1], 0.05);
+        S.vmax  = Math.max(m[0], m[1], 0.05);
+      }
+      consumeProbeArr(pr, tag);
+    }).catch(() => { if (gen === WG.gen) WG.mapBusy = false; });
+  }
+
+  S.t += simmed;
+  const k = pistonKinematics(S.t);
+  S.pistonX = k.x; S.pistonV = k.v; S.firing = S.t < P.pushMs;
+  return simmed;
+}
+
+/* probe buffer is a plain u_z column, not the interleaved RGBA the GL path reads */
+function consumeProbeArr(buf, t){
+  const axis = buf[0];
+  let mx = 0, Q = 0, mom = 0;
+  for (let ir = 0; ir < S.Nr; ir++){
+    const uz = buf[ir];
+    if (!Number.isFinite(uz)) continue;
+    if (Math.abs(uz) > Math.abs(mx)) mx = uz;
+    const rc = (ir + 0.5) * S.dr, dA = 2 * Math.PI * rc * S.dr;
+    if (uz > 0){ Q += uz * dA; mom += uz * uz * dA; }
+  }
+  S.meas = { axis, mx, Q, mom };
+  if (mx > S.peak){ S.peak = mx; S.peakT = t; }
+  if (S.arrival < 0 && mx > 0.25) S.arrival = t;
+  S.series.push([t, axis, mx]);
+  if (S.series.length > 4000) S.series.splice(0, 2000);
+}
+
+function wgpuReset(){
+  const dev = WG.dev;
+  wgpuParams(0, 0.01);
+  dev.queue.writeBuffer(WG.buf.params, 0, WG.paramHost, 0, PARAM_STRIDE);
+  WG.velPar = 0; WG.prePar = 0; WG.dyePar = 0;
+  const enc = dev.createCommandEncoder();
+  const pass = enc.beginComputePass();
+  pass.setBindGroup(0, WG.bgP, [0]);
+  const bg = () => WG.bgF[(WG.velPar ? 4 : 0) | (WG.prePar ? 2 : 0) | (WG.dyePar ? 1 : 0)];
+  // clearAll writes velD/preD/vor/div; run it for both parities so every buffer is zeroed
+  for (let i = 0; i < 2; i++){
+    pass.setBindGroup(1, bg());
+    wgDispatch(pass, WG.pipe.clearAll, S.Nz + 1, S.Nr + 1, 8, 8);
+    WG.velPar ^= 1; WG.prePar ^= 1;
+  }
+  for (let i = 0; i < 2; i++){
+    pass.setBindGroup(1, bg());
+    wgDispatch(pass, WG.pipe.dyeInit, S.Nz, S.Nr, 8, 8);
+    WG.dyePar ^= 1;
+  }
+  pass.end();
+  dev.queue.submit([enc.finish()]);
+}
+
+function wgpuRender(){
+  const dev = WG.dev;
+  const cv = WG.canvas;
+  const w = cv.width, h = cv.height;
+  const g = VIEW.gain;
+  let base;
+  switch (VIEW.field){
+    case 1: base = Math.max(S.vmax * 0.75, 1e-3); break;
+    case 2: base = Math.max(S.vmax / Math.min(S.dz, S.dr) * 0.12, 1e-3); break;
+    case 3: base = Math.max(S.vmax * S.vmax * 0.4, 1e-3); break;
+    case 4: base = Math.max(S.vmax * 0.75, 1e-3); break;
+    default: base = 1;
+  }
+  const su = new Float32Array(8);
+  su[0] = w; su[1] = h; su[2] = VIEW.field; su[3] = base / g;
+  su[4] = VIEW.showGeom ? 1 : 0;
+  su[5] = Math.min(S.Lz - S.dz, S.Z1 + P.plateT + P.probe);
+  dev.queue.writeBuffer(WG.buf.showU, 0, su);
+
+  const enc = dev.createCommandEncoder();
+  const pass = enc.beginRenderPass({ colorAttachments:[{
+    view: WG.ctx.getCurrentTexture().createView(),
+    clearValue:{ r:0.02, g:0.03, b:0.04, a:1 }, loadOp:'clear', storeOp:'store' }] });
+  pass.setPipeline(WG.pipe.show);
+  pass.setBindGroup(0, WG.bgP, [0]);
+  pass.setBindGroup(1, WG.bgFS[(WG.velPar ? 4 : 0) | (WG.prePar ? 2 : 0) | (WG.dyePar ? 1 : 0)]);
+  pass.setBindGroup(2, WG.bgS);
+  pass.draw(3);
+  pass.end();
+  dev.queue.submit([enc.finish()]);
+}
+</script>
+
 <script>
 "use strict";
 /* ========================== control panel ========================== */
@@ -1234,10 +2080,14 @@ function frame(){
     if (pendingRebuild){ buildGrid(); pendingRebuild = false; }
     let simmed = 0;
     const n = OPT.autoPace ? Math.max(1, Math.round(S.spfAuto)) : P.spf;
-    for (let i = 0; i < n; i++){ const dt = chooseDt(); step(dt); simmed += dt; }
+    if (WG.ok){
+      simmed = wgpuSteps(n);
+    } else {
+      for (let i = 0; i < n; i++){ const dt = chooseDt(); step(dt); simmed += dt; }
+    }
     S.frameDt = simmed;
   }
-  if (readerPoll(S.rdMax)){
+  if (!WG.ok && readerPoll(S.rdMax)){
     const vr = S.rdMax.data[0], vz = S.rdMax.data[1];
     if (!Number.isFinite(vr) || !Number.isFinite(vz) || Math.max(vr, vz) > 5000)
       flagDivergence(Math.max(vr, vz));
@@ -1247,8 +2097,8 @@ function frame(){
       S.vmax  = Math.max(vr, vz, 0.05);
     }
   }
-  if (readerPoll(S.rdProbe)) consumeProbe(S.rdProbe.data, S.rdProbe.tag);
-  if (S.running){
+  if (!WG.ok && readerPoll(S.rdProbe)) consumeProbe(S.rdProbe.data, S.rdProbe.tag);
+  if (!WG.ok && S.running){
     readerIssue(S.rdMax, reduceRender().fbo, 0, 0, 1, 1);
     S.rdProbe.tag = S.t;
     readerIssue(S.rdProbe, S.vel.read.fbo, probeIz().iz, 0, 1, S.Nr + 1);
@@ -1287,7 +2137,9 @@ function frame(){
     (S.firing ? '   ▶ pushing' : '   ■ coasting') + `\n` +
     `${fps.toFixed(0)} fps   ${steps} steps/frame   ` +
     `${S.simRate.toFixed(1)} ms of flight per second\n` +
-    `${(steps*(P.iters+6)).toLocaleString()} passes/frame @ ${S.passUs.toFixed(0)} µs`;
+    (WG.ok
+      ? `WebGPU compute   ${(steps*(7 + P.iters)).toLocaleString()} dispatches/frame, 1 submit`
+      : `WebGL2 fragment   ${(steps*(P.iters+6)).toLocaleString()} passes/frame @ ${S.passUs.toFixed(0)} µs`);
 
   requestAnimationFrame(frame);
 }
@@ -1303,10 +2155,18 @@ function flagDivergence(v){
     `Raise <b>pressure iterations</b>, or lower the <b>CFL number</b>, then fire again.`;
 }
 
-buildGrid();
-S.passUs = measurePassCost();
-updateMetrics();
-requestAnimationFrame(frame);
+(async function boot(){
+  const usedGPU = await wgpuInit();
+  if (usedGPU){
+    document.getElementById('view').style.display = 'none';
+    WG.canvas.style.display = 'block';
+  }
+  buildGrid();
+  S.passUs = usedGPU ? 0 : measurePassCost();
+  S.backend = usedGPU ? 'WebGPU compute' : 'WebGL2 fragment';
+  updateMetrics();
+  requestAnimationFrame(frame);
+})();
 </script>
 </body>
 </html>

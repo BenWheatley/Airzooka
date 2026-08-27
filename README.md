@@ -97,10 +97,17 @@ A convergence check at 15 ms of flight (64 radial cells, 5 mm exit):
 The default of 120 sits within a few percent of converged. Raise it if a result
 looks marginal.
 
+## Backends
+
+The simulator runs on **WebGPU compute** where it is available and falls back to the original
+**WebGL2 fragment-shader** path otherwise. The HUD names the live backend. Both produce
+**bit-identical** results: driven with the same timestep sequence for 500 steps, the two
+paths agreed to a maximum absolute difference of exactly 0.
+
 ## Performance
 
-The solver is **render-pass bound, not pixel bound**, which is unintuitive and worth knowing
-before trying to tune it. Measured on an Apple M1 through ANGLE's Metal backend:
+The WebGL2 path is **render-pass bound, not pixel bound**, which is unintuitive and worth
+knowing. Measured on an Apple M1 through ANGLE's Metal backend:
 
 | per pass | µs |
 |---|---|
@@ -109,45 +116,71 @@ before trying to tune it. Measured on an Apple M1 through ANGLE's Metal backend:
 | + texture rebind | ~93 |
 
 The switch cost is essentially independent of texture size and format — R32F, RGBA8 and a
-64×64 target all land within a factor of 1.5 of each other. So the cost of a run is
-**steps × (pressure iterations + 6) × ~70 µs**, and the pixel count barely enters.
+64×64 target all land within a factor of 1.5. So cost is **steps × (iterations + 6) × ~70 µs**,
+and the pixel count barely enters. Two consequences:
 
-Two consequences:
+- **Halving the resolution does not quarter the run time.** It only helps by allowing a larger
+  timestep, so the gain is roughly linear, not quadratic. This surprises people.
+- **Pressure iterations are the main dial**, since each one is a whole render pass.
 
-- **Halving the resolution does not quarter the run time.** It only helps by allowing a
-  larger timestep, so the gain is roughly linear, not quadratic. This surprises people.
-- **Pressure iterations are the main dial.** Each one is a whole render pass.
+A WebGPU **compute dispatch costs ~4 µs against that ~65 µs**, which is the entire reason for
+the second backend.
 
-What that made worth doing:
+### What was worth doing
 
-- Solid-boundary enforcement folded into the `forces` and `proj` shaders, removing two
-  passes per step.
-- `invalidateFramebuffer` before each pass, since every pass overwrites all its pixels.
-- Fewer pressure iterations, paid for with a smaller CFL number. Measured at 15 ms of
-  flight, `cfl 0.5 / 30 iterations` reads **83.6** m/s against `cfl 1.0 / 120 iterations`
-  at **79.5**, for 36 % fewer passes — better and cheaper.
+Common to both backends:
+
+- Solid-boundary enforcement folded into the `forces` and `proj` kernels, removing two passes
+  per step.
+- Fewer pressure iterations, paid for with a smaller CFL number. At 15 ms of flight,
+  `cfl 0.5 / 30 iterations` reads **83.6** m/s against `cfl 1.0 / 120 iterations` at **79.5** —
+  better *and* 36 % fewer passes.
 - **Axial cell stretching.** The jet is long and thin and the timestep is set by the axial
-  velocity, so axial cells can be ~2× the radial size. Measured effect at 25 ms:
-  peak 42.6 → 43.0 m/s for 1.7× the speed.
+  velocity, so axial cells can be ~2× the radial size: peak 42.6 → 43.0 m/s for 1.7× the speed.
 - A **directional CFL**, `dt = cfl / (u_z/dz + u_r/dr)`, without which stretching buys nothing.
-- Steps per frame **auto-paced** to a frame-time budget, so the window stays responsive
-  whatever the geometry does to the timestep.
+- Steps per frame **auto-paced** to a frame-time budget.
 
-End-to-end, simulating the as-printed 5 mm case:
+WebGL2 only: `invalidateFramebuffer` before each pass, worth ~16 %.
+
+WebGPU only:
+
+- Every dispatch for every step of a frame goes into **one command encoder, submitted once**,
+  with per-step uniforms addressed by dynamic offset.
+- A `prepare` kernel folds geometry, boundary conditions and `1/den` into four coefficients
+  and a scaled right-hand side, once per step. The Jacobi inner loop then costs one `dot`
+  instead of five `solidAt` evaluations — **32.5 → 14.4 µs per iteration**.
+
+### A tiling optimisation that did not work
+
+The obvious WebGPU win looks like workgroup shared memory: load a tile plus halo, run several
+Jacobi iterations with barriers, write once, and cut dispatches fourfold. Built and measured,
+it was **1.69× slower** than the naive one-iteration-per-dispatch kernel (17.1 vs 10.1 µs per
+iteration).
+
+The reasoning was wrong because a dispatch costs only ~4 µs here, so there is nothing to
+amortise, while the halo makes each workgroup compute 2.25× the cells it keeps. The simple
+kernel is memory-bandwidth bound, which is the right place to be. It was deleted.
+
+### Where it ended up
+
+Simulating the as-printed 5 mm case:
 
 | | ms of flight per second | a 150 ms shot |
 |---|---|---|
-| original settings | 0.55 | 272 s |
-| Balanced (default) | 2.5 | 60 s |
-| Draft | 9.3 | 16 s |
-| a ring design (18.5 mm exit), Balanced | 554 | under a second |
+| original WebGL2 settings | 0.55 | 272 s |
+| tuned WebGL2, Balanced | 2.5 | 60 s |
+| **WebGPU, Balanced** | **16.0** | **9.4 s** |
+| **WebGPU, Draft** | **63.2** | **2.4 s** |
+| a ring design (18.5 mm exit) | faster than real time | instant |
 
-The last row is the important one: **the small orifice is the expensive case**, because the
-timestep scales with `1/u_max` and `u_max` scales with `1/r_exit²`. Any design worth printing
-runs effectively instantly.
+**29× on the default, 115× on Draft.** The small orifice remains the expensive case, because
+the timestep scales with `1/u_max` and `u_max` scales with `1/r_exit²`. Any design worth
+printing runs effectively instantly.
 
-Below about 30 pressure iterations the solve stops enforcing mass conservation and the run
-diverges outright (velocities to NaN); the slider is clamped there and a guard catches it.
+Below about 30 pressure iterations the solve stops enforcing mass conservation and diverges
+outright; the slider is clamped there and a guard catches it.
+
+
 
 ## Accuracy: what is *not* converged
 
