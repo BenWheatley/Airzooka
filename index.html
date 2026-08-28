@@ -38,6 +38,9 @@
   #metrics h4{margin:0 0 4px; font:600 11px/1.4 var(--mono); color:var(--accent);
               letter-spacing:.08em; text-transform:uppercase}
   #metrics hr{border:0; border-top:1px solid var(--line); margin:7px 0}
+  #metrics .void{opacity:.4}
+  #metrics .void .v{text-decoration:line-through}
+  #metrics .void h4{color:var(--bad)}
 
   #panel{flex:0 0 330px; background:var(--panel); border-left:1px solid var(--line);
          overflow-y:auto; padding:10px 12px 40px}
@@ -965,6 +968,11 @@ function render(){
 
 /* ========================== derived design numbers ========================== */
 const MMS_TO_MS = 1;                       // 1 mm/ms == 1 m/s
+/* Compressible-flow reference points for air at 20 °C, used only to police the model's
+   own validity — none of this is simulated. */
+const A_SOUND   = 343;    // m/s, ambient
+const V_CHOKED  = 313;    // m/s, sonic throat: the hard ceiling for a *converging* nozzle
+const V_DELAVAL = 767;    // m/s, a perfect converging-diverging nozzle expanding to vacuum
 function derived(){
   const Rb = P.boreR, re = Math.min(P.exitR, Rb - 0.25);
   const Sd = Math.min(P.stroke, maxStroke());
@@ -978,18 +986,36 @@ function derived(){
   const mach = vExit / 343;
   const Re = vExit * 2*re / Math.max(P.visc, 1e-9);
   const gapFrac = P.pistonClr > 0 ? 1 - Math.pow((Rb - P.pistonClr)/Rb, 2) : 0;
-  return { Rb, re, Sd, Vswept, Lslug, LD, reOpt, vPiston, vExit, mach, Re, gapFrac };
+  // Peak acceleration of a half-sine stroke, as a sanity check on the drive itself.
+  const accel = vPiston * Math.PI / P.pushMs * 1000;         // m/s²
+  return { Rb, re, Sd, Vswept, Lslug, LD, reOpt, vPiston, vExit, mach, Re, gapFrac, accel };
 }
 
 const fmt = (x, d = 1) => (Number.isFinite(x) ? x.toFixed(d) : '—');
 function updateMetrics(){
   const D = derived(), m = S.meas || { axis:0, mx:0, Q:0 };
   const flags = [];
+  // This solver is incompressible by construction: constant density, and pressure that
+  // propagates instantly. Past about Mach 0.3 that is not an approximation any more.
+  const machMeas = S.vmax / A_SOUND;
+  const compressible = machMeas > 0.3 || D.mach > 0.3;
+  if (compressible) flags.push(['bad',
+    `<b>Compressible regime — these results are not physical.</b> Peak speed in the domain is ` +
+    `${fmt(S.vmax,0)} m/s = Mach ${fmt(machMeas,2)}. This solver assumes constant density and ` +
+    `infinite sound speed, so it has no shocks, no choking and no way to be right here. ` +
+    `A <i>converging</i> nozzle physically cannot exceed <b>${V_CHOKED} m/s</b> — it chokes at ` +
+    `Mach 1 at the throat, and going faster needs a converging–diverging (de Laval) nozzle. ` +
+    `Even a perfect one exhausting to vacuum caps at ${V_DELAVAL} m/s. ` +
+    `Reduce the drive or open the exit until this warning clears.`]);
   if (D.LD > 8)  flags.push(['bad', `Slug L/D = ${fmt(D.LD)}. A vortex ring pinches off at L/D ≈ 4 and everything after that is a trailing jet that stalls within a few diameters. This is the main reason a small orifice does not throw air further.`]);
   else if (D.LD < 1.5) flags.push(['warn', `Slug L/D = ${fmt(D.LD,2)} — too short to roll up a ring. Longer stroke or smaller exit.`]);
   else flags.push(['good', `Slug L/D = ${fmt(D.LD,2)} — in the ring-formation window (≈ 4 is optimum).`]);
   if (D.mach > 0.3) flags.push(['bad', `Exit speed ${fmt(D.vExit)} m/s = Mach ${fmt(D.mach,2)}. The incompressible solver stops being valid here, and a real 3D-printed nozzle would choke and dump the energy as heat and noise.`]);
   else if (D.mach > 0.15) flags.push(['warn', `Exit speed ${fmt(D.vExit)} m/s — compressibility starts to matter above ~100 m/s.`]);
+  if (D.vPiston / A_SOUND > 0.1) flags.push(['bad',
+    `The piston itself moves at ${fmt(D.vPiston,0)} m/s (Mach ${fmt(D.vPiston/A_SOUND,2)}), ` +
+    `peaking at ${fmt(D.accel/9.81,0)} g. Nothing hand- or spring-driven does that; the drive ` +
+    `settings are outside anything printable, never mind what the solver does with them.`]);
   if (D.gapFrac > 0.03) flags.push(['warn', `Piston clearance leaks ${fmt(D.gapFrac*100)}% of the bore area. Blow-by past the piston bypasses the muzzle entirely.`]);
   if (P.stroke > maxStroke() + 0.5) flags.push(['warn', `Stroke clipped to ${fmt(D.Sd)} mm — the piston would hit the orifice plate.`]);
   flags.push(['warn', `The velocities above the line are analytic and solid. The measured ` +
@@ -1000,7 +1026,12 @@ function updateMetrics(){
   const rows = (title, list) => `<h4>${title}</h4>` + list.map(
     ([k,v]) => `<div class="row"><span class="k">${k}</span><span class="v">${v}</span></div>`).join('');
 
+  // A warning that invalidates the numbers belongs above them, not below the fold.
+  const critical = flags.filter(f => f[0] === 'bad');
+  const rest     = flags.filter(f => f[0] !== 'bad');
+
   DOM.metrics.innerHTML =
+    critical.map(([c,t]) => `<div class="flag ${c}">${t}</div>`).join('') +
     rows('Design', [
       ['swept volume',    fmt(D.Vswept/1000,1) + ' mL'],
       ['exit / bore area',fmt((D.Rb*D.Rb)/(D.re*D.re),1) + ' : 1'],
@@ -1009,16 +1040,18 @@ function updateMetrics(){
       ['exit R for L/D=4',fmt(D.reOpt,1) + ' mm'],
       ['peak piston',     fmt(D.vPiston,2) + ' m/s'],
       ['mean exit speed', fmt(D.vExit,1) + ' m/s (M ' + fmt(D.mach,2) + ')'],
+      ['choking ceiling', V_CHOKED + ' m/s'],
       ['exit Reynolds',   D.Re > 1e4 ? (D.Re/1000).toFixed(0)+'k' : fmt(D.Re,0)],
     ]) + '<hr>' +
-    rows(`At target (${fmt(P.probe,0)} mm)`, [
+    `<div class="${compressible ? 'void' : ''}">` +
+    rows(`At target (${fmt(P.probe,0)} mm)` + (compressible ? ' — INVALID' : ''), [
       ['on-axis u_z',   fmt(m.axis,2) + ' m/s'],
       ['peak u_z now',  fmt(m.mx,2) + ' m/s'],
       ['peak u_z ever', fmt(S.peak,2) + ' m/s' + (S.peak > 0.05 ? ` @ ${fmt(S.peakT,0)} ms` : '')],
       ['arrival',       S.arrival >= 0 ? fmt(S.arrival,0) + ' ms' : 'not yet'],
       ['volume flux',   fmt(m.Q,0) + ' mL/s'],
-    ]) +
-    flags.map(([c,t]) => `<div class="flag ${c}">${t}</div>`).join('');
+    ]) + '</div>' +
+    rest.map(([c,t]) => `<div class="flag ${c}">${t}</div>`).join('');
 }
 
 /* ========================== time-series plot ========================== */

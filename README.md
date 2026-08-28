@@ -202,6 +202,44 @@ versus a straight shear tube that never pinches off — is robust and reproduces
 resolution. The **measured velocities at the target plane are good to about a factor of two**
 and should only ever be used to rank designs, never quoted.
 
+## Compressibility: a hard limit, not a soft one
+
+This solver is **incompressible by construction**. Density is constant, and the pressure
+Poisson solve propagates information across the whole domain instantaneously — an infinite
+speed of sound. It therefore has no acoustic waves, no shocks and no choking. Above roughly
+**Mach 0.3 it is not approximate, it is inapplicable**, and it will still hand you a
+confident-looking number.
+
+Reference points for air at 20 °C, none of them simulated:
+
+| | m/s |
+|---|---|
+| ambient speed of sound | 343 |
+| **sonic throat — hard ceiling for a converging nozzle** | **313** |
+| perfect de Laval nozzle expanding to vacuum | 767 |
+
+The 313 m/s figure is the one that matters. A tapered barrel is a *converging* nozzle, and a
+converging nozzle **cannot** produce supersonic flow at any driving pressure: it chokes at
+Mach 1 at the throat and the mass flow stops responding. Exceeding it requires a
+converging–diverging (de Laval) nozzle, and even a perfect one exhausting into vacuum caps at
+767 m/s. Any reading above ~313 m/s from a converging geometry is a modelling artefact.
+
+The constant-density assumption fails just as hard: real air is 0.63× stagnation density at
+Mach 1 and 0.23× at Mach 2, so the solver's mass flux is out by 1.6× and 4.3× respectively.
+
+### The guard
+
+Whenever the analytic exit speed or the measured peak exceeds Mach 0.3, the metrics panel
+puts a red banner **above** the numbers and strikes through the measured block. A separate
+check flags drive settings that are unbuildable regardless of the flow — for example a
+229 mm stroke in 2 ms needs the piston itself to reach 180 m/s (Mach 0.52) at about
+28,800 g, which nothing hand- or spring-driven will do.
+
+Making this regime *correct* would mean a different solver: compressible Euler or
+Navier–Stokes with a density field, an energy equation and a shock-capturing scheme. That is
+a rewrite, not a setting — and it is unnecessary for the actual design question, which lives
+comfortably below Mach 0.05.
+
 ## Not modelled
 
 The flange, handle, greebles and screw holes, since they are outside the flow.
