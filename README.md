@@ -202,7 +202,90 @@ versus a straight shear tube that never pinches off — is robust and reproduces
 resolution. The **measured velocities at the target plane are good to about a factor of two**
 and should only ever be used to rank designs, never quoted.
 
-## Compressibility: a hard limit, not a soft one
+## Two physical models
+
+The sandbox carries **two solvers** and picks between them on the analytic exit Mach number.
+Neither is right everywhere, and pretending otherwise was the previous version's mistake.
+
+| | incompressible | compressible |
+|---|---|---|
+| equations | constant density, pressure projection | Navier–Stokes, conserved (ρ, ρu, E) |
+| numerics | MAC grid, semi-Lagrangian, Jacobi Poisson | finite volume, HLLC + MUSCL, SSP-RK2 |
+| acoustics | none — infinite sound speed | resolved |
+| valid | below about Mach 0.3 | any speed |
+| speed at Mach 0.02 | 16 ms of flight per second | 2.8 |
+
+Below Mach 0.3 the incompressible model is not a shortcut, it is the correct limit: density
+varies by under 5 %, and it is ~6× faster because it does not have to resolve sound waves the
+flow does not care about. Above Mach 0.3 it is not approximate but inapplicable. The
+compressible solver is right everywhere but pays a timestep set by the sound speed, so at
+Mach 0.02 it takes about 50× more steps than the flow itself needs.
+
+**Auto** picks incompressible below Mach 0.25 and compressible above it. Both can be forced.
+
+## Compressible solver: validation
+
+Not "it runs" — checked against exact solutions.
+
+**Sod shock tube**, against the exact Riemann solution, 601 cells:
+
+| | L1 error |
+|---|---|
+| density | 0.17 % |
+| velocity | 0.18 % |
+| pressure | 0.09 % |
+
+with **zero overshoot** at every resolution tested, confirming the minmod limiter is TVD.
+Grid convergence in L1 was 0.88 and 0.80 over successive doublings — first order, which is the
+correct and expected rate for a solution containing discontinuities regardless of the scheme's
+formal second-order accuracy.
+
+**Speed of sound**: a 1 % Gaussian pressure pulse in still air propagated at **344 m/s**
+against a theoretical 343.1 m/s — 0.26 % error. Total mass drifted by 4×10⁻⁴ %. This is the
+quantity the incompressible model gets infinitely wrong.
+
+**Choking**, discharging a reservoir through the 5 mm orifice at rising pressure ratios:
+
+| p₀/p_amb | throat Mach | ṁ / (A·p₀) |
+|---|---|---|
+| 1.2 | 0.45 | 1.25e-3 |
+| 1.5 | 0.70 | 1.73e-3 |
+| 1.893 (critical) | 0.91 | 1.95e-3 |
+| 3 | 1.14 | **2.057e-3** |
+| 6 | 1.20 | **2.061e-3** |
+| 12 | 1.21 | **2.059e-3** |
+
+The mass flow **saturates** above the critical ratio — the flow chokes and stops responding to
+pressure. The plateau sits at 87 % of the ideal 2.361e-3, which is the discharge coefficient
+of a sharp-edged short-tube orifice: a real vena-contracta effect, not an error.
+
+**Low Mach**: the vortex ring still forms and propagates at Mach 0.02, confirming the
+Thornber low-Mach reconstruction fix is doing its job. Without it, upwind dissipation growing
+as 1/M would have dissolved the ring — the very thing the tool exists to study.
+
+## A correction to an earlier claim
+
+An earlier version of this file said a converging nozzle "cannot exceed 313 m/s". That
+conflated two different things and was too strong.
+
+- Sonic velocity caps the **throat**. That part is right, and the choking table above
+  demonstrates it.
+- The **free jet downstream** of an underexpanded orifice can and does go supersonic, through
+  a Prandtl–Meyer expansion at the lip. The real ceiling on the plume is `sqrt(2 cp T0)` at the
+  **stagnation** temperature — and T0 rises when the gas is compressed.
+
+Running the 250 mm/2 ms/12.5 mm-taper case properly shows why this matters. The compressible
+solver finds a peak barrel pressure of **33.3 bar**, which matches the isentropic compression
+ratio of that stroke (250/21)^1.4 = 32.6 almost exactly. That raises stagnation temperature to
+~777 K, whose thermodynamic ceiling is 1250 m/s. The solver reports a peak of **1200 m/s** —
+just under it, and therefore physical. The incompressible solver reported 2416 m/s, nearly
+twice the ceiling.
+
+So the 676 m/s reading was not impossible in principle; it needed a very large pressure ratio,
+and those settings do produce one. What makes the configuration unbuildable is the 33 bar: the
+piston would be pushing against about 6.5 kN, and the printed barrel would burst long first.
+
+## Compressibility: a hard limit for the incompressible model
 
 This solver is **incompressible by construction**. Density is constant, and the pressure
 Poisson solve propagates information across the whole domain instantaneously — an infinite

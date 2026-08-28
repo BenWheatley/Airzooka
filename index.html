@@ -659,7 +659,18 @@ const S = {
   series:[], peak:0, peakT:-1, arrival:-1,
   spfAuto:8, wallSmooth:16, simRate:0, passUs:0, diverged:false,
 };
-const OPT = { autoPace:true };
+const OPT = { autoPace:true, model:'auto' };
+/* Neither model is right everywhere. Incompressible is exact-in-the-limit below about
+   Mach 0.3 and roughly six times faster there, because it does not have to resolve
+   acoustics. Compressible is right at any speed but pays a timestep set by the sound
+   speed, which at Mach 0.02 means ~50x more steps than the flow itself needs. Auto picks
+   on the analytic exit Mach, which is known before the run starts. */
+function resolveModel(){
+  if (!CP.ok) return 'incompressible';
+  if (OPT.model !== 'auto') return OPT.model;
+  return derived().mach > 0.25 ? 'compressible' : 'incompressible';
+}
+const usingComp = () => S.activeModel === 'compressible';
 
 function pistonKinematics(t){
   const T = P.pushMs, Smax = maxStroke(), Sd = Math.min(P.stroke, Smax);
@@ -707,7 +718,8 @@ function buildGrid(){
     w = Math.max(1, Math.ceil(w/2)); h = Math.max(1, Math.ceil(h/2));
     S.reduce.push(makeTarget(w, h, gl.RGBA32F, gl.RGBA));
   }
-  if (WG.ok) wgpuAlloc();
+  S.activeModel = resolveModel();
+  if (WG.ok){ wgpuAlloc(); if (CP.ok) compAlloc(); }
   resizeCanvas();
   resetSim();
 }
@@ -789,6 +801,7 @@ function resetSim(){
   S.series.length = 0; S.peak = 0; S.peakT = -1; S.arrival = -1; S.vmax = 1;
   S.vzmax = 1; S.vrmax = 1;
   S.diverged = false; document.getElementById('diverged').style.display = 'none';
+  if (usingComp()){ compReset(); return; }
   if (WG.ok){ wgpuReset(); return; }
   for (const d of [S.vel, S.pres, S.vort]){ clearTarget(d.a); clearTarget(d.b); }
   clearTarget(S.div);
@@ -945,6 +958,7 @@ function resizeCanvas(){
 window.addEventListener('resize', () => { if (S.Nz) resizeCanvas(); });
 
 function render(){
+  if (usingComp()){ compRender(); return; }
   if (WG.ok){ wgpuRender(); return; }
   const g = VIEW.gain;
   let base;
@@ -968,11 +982,14 @@ function render(){
 
 /* ========================== derived design numbers ========================== */
 const MMS_TO_MS = 1;                       // 1 mm/ms == 1 m/s
-/* Compressible-flow reference points for air at 20 °C, used only to police the model's
-   own validity — none of this is simulated. */
+/* Compressible-flow reference points for air at 20 °C.
+   Note the distinction: sonic velocity caps the *throat* of a converging nozzle, but the
+   free jet downstream of an underexpanded orifice can and does go supersonic. The real
+   ceiling on the plume is sqrt(2 cp T0) at the *stagnation* temperature, which rises when
+   the gas is compressed. */
 const A_SOUND   = 343;    // m/s, ambient
-const V_CHOKED  = 313;    // m/s, sonic throat: the hard ceiling for a *converging* nozzle
-const V_DELAVAL = 767;    // m/s, a perfect converging-diverging nozzle expanding to vacuum
+const V_CHOKED  = 313;    // m/s, sonic throat of a converging nozzle from a 293 K reservoir
+const V_DELAVAL = 767;    // m/s, expanding a 293 K reservoir to vacuum
 function derived(){
   const Rb = P.boreR, re = Math.min(P.exitR, Rb - 0.25);
   const Sd = Math.min(P.stroke, maxStroke());
@@ -999,14 +1016,17 @@ function updateMetrics(){
   // propagates instantly. Past about Mach 0.3 that is not an approximation any more.
   const machMeas = S.vmax / A_SOUND;
   const compressible = machMeas > 0.3 || D.mach > 0.3;
-  if (compressible) flags.push(['bad',
-    `<b>Compressible regime — these results are not physical.</b> Peak speed in the domain is ` +
-    `${fmt(S.vmax,0)} m/s = Mach ${fmt(machMeas,2)}. This solver assumes constant density and ` +
-    `infinite sound speed, so it has no shocks, no choking and no way to be right here. ` +
-    `A <i>converging</i> nozzle physically cannot exceed <b>${V_CHOKED} m/s</b> — it chokes at ` +
-    `Mach 1 at the throat, and going faster needs a converging–diverging (de Laval) nozzle. ` +
-    `Even a perfect one exhausting to vacuum caps at ${V_DELAVAL} m/s. ` +
-    `Reduce the drive or open the exit until this warning clears.`]);
+  const onComp = usingComp();
+  if (compressible && !onComp) flags.push(['bad',
+    `<b>Compressible regime — the incompressible solver cannot be right here.</b> Peak speed ` +
+    `is ${fmt(S.vmax,0)} m/s = Mach ${fmt(machMeas,2)}, and this model assumes constant ` +
+    `density and infinite sound speed, so it has no shocks and no choking. ` +
+    `Switch the <b>physical model</b> to compressible (or Auto), which handles this correctly.`]);
+  else if (compressible && onComp) flags.push(['warn',
+    `Compressible regime — Mach ${fmt(machMeas,2)}. The solver handles this correctly, but the ` +
+    `<i>device</i> may not: a converging exit chokes at Mach 1 in the throat (about ` +
+    `${V_CHOKED} m/s), and anything faster downstream is an underexpanded jet that needs a ` +
+    `large pressure ratio in the barrel to sustain.`]);
   if (D.LD > 8)  flags.push(['bad', `Slug L/D = ${fmt(D.LD)}. A vortex ring pinches off at L/D ≈ 4 and everything after that is a trailing jet that stalls within a few diameters. This is the main reason a small orifice does not throw air further.`]);
   else if (D.LD < 1.5) flags.push(['warn', `Slug L/D = ${fmt(D.LD,2)} — too short to roll up a ring. Longer stroke or smaller exit.`]);
   else flags.push(['good', `Slug L/D = ${fmt(D.LD,2)} — in the ring-formation window (≈ 4 is optimum).`]);
@@ -1043,8 +1063,8 @@ function updateMetrics(){
       ['choking ceiling', V_CHOKED + ' m/s'],
       ['exit Reynolds',   D.Re > 1e4 ? (D.Re/1000).toFixed(0)+'k' : fmt(D.Re,0)],
     ]) + '<hr>' +
-    `<div class="${compressible ? 'void' : ''}">` +
-    rows(`At target (${fmt(P.probe,0)} mm)` + (compressible ? ' — INVALID' : ''), [
+    `<div class="${compressible && !onComp ? 'void' : ''}">` +
+    rows(`At target (${fmt(P.probe,0)} mm)` + (compressible && !onComp ? ' — INVALID' : ''), [
       ['on-axis u_z',   fmt(m.axis,2) + ' m/s'],
       ['peak u_z now',  fmt(m.mx,2) + ' m/s'],
       ['peak u_z ever', fmt(S.peak,2) + ' m/s' + (S.peak > 0.05 ? ` @ ${fmt(S.peakT,0)} ms` : '')],
@@ -1052,6 +1072,7 @@ function updateMetrics(){
       ['volume flux',   fmt(m.Q,0) + ' mL/s'],
     ]) + '</div>' +
     rest.map(([c,t]) => `<div class="flag ${c}">${t}</div>`).join('');
+  modelBlurb();
 }
 
 /* ========================== time-series plot ========================== */
@@ -1114,6 +1135,8 @@ struct Params {
   pist  : vec4<f32>,          // pz0, pz1, pr, pv
   flu   : vec4<f32>,          // visc, vortEps, dyeDiss, smag
   misc  : vec4<f32>,          // seed, probeIz, _, _
+  gas   : vec4<f32>,          // gamma, rho0, p0, rk weight  (compressible solver only)
+  gas2  : vec4<f32>,          // a0, spongeZ, spongeR, Pr
 };
 @group(0) @binding(0) var<uniform> P : Params;
 `;
@@ -1689,7 +1712,7 @@ function wgpuAlloc(){
       { binding:3, resource:{ buffer: y ? B2.dyeB : B2.dyeA } } ]}));
   }
   WG.bgP = dev.createBindGroup({ layout:WG.bglP, entries:[
-    { binding:0, resource:{ buffer:B2.params, size:112 } }] });
+    { binding:0, resource:{ buffer:B2.params, size:144 } }] });
 
   // reduction chain
   B2.showU = dev.createBuffer({ size:32, usage:GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
@@ -1931,6 +1954,809 @@ function wgpuRender(){
 
 <script>
 "use strict";
+/* ==========================================================================
+   Compressible solver — axisymmetric Navier–Stokes, density-based.
+
+   Conserved state U = (rho, rho*u_z, rho*u_r, E) as cell averages on a finite
+   volume grid. Fluxes from an HLLC approximate Riemann solver with MUSCL
+   reconstruction and a minmod limiter, advanced by SSP-RK2. This carries real
+   acoustics, so it chokes, forms shocks and cannot exceed the physical exit
+   velocity the way the incompressible solver could.
+
+   Two things make this workable where a naive Godunov scheme would not:
+
+   1. A low-Mach correction (Thornber et al. 2008) on the reconstructed
+      velocities. Standard upwind flux has dissipation that grows like 1/M, so
+      without this it would shred the vortex ring at M ~ 0.02 -- exactly the
+      case this tool exists to study.
+   2. Reflecting-wall Riemann fluxes rather than ghost cells, which stays
+      robust across the moving piston boundary.
+
+   Units are mm, ms, microgram: velocity comes out in m/s, density in kg/m^3
+   and pressure in Pa, all consistent and all order-one to order-1e5.
+   ========================================================================== */
+
+const AIR = {
+  gamma: 1.4,
+  R:     287.0,          // J/(kg K)
+  T0:    293.0,          // K
+  p0:    101325.0,       // Pa
+  Pr:    0.72,
+};
+AIR.rho0 = AIR.p0 / (AIR.R * AIR.T0);            // 1.205 kg/m^3
+AIR.a0   = Math.sqrt(AIR.gamma * AIR.R * AIR.T0); // 343 m/s
+AIR.E0   = AIR.p0 / (AIR.gamma - 1);
+
+const WGSL_COMP = `
+struct Params {
+  cells : vec2<i32>,
+  faces : vec2<i32>,
+  d     : vec2<f32>,
+  dtlz  : vec2<f32>,
+  geoA  : vec4<f32>,
+  geoB  : vec4<f32>,
+  pist  : vec4<f32>,
+  flu   : vec4<f32>,
+  misc  : vec4<f32>,
+  gas   : vec4<f32>,          // gamma, rho0, p0, stage weight
+  gas2  : vec4<f32>,          // a0, spongeWidth, Pr, _
+};
+@group(0) @binding(0) var<uniform> P : Params;
+
+@group(1) @binding(0) var<storage, read>       Ua : array<vec4<f32>>;   // U^n
+@group(1) @binding(1) var<storage, read_write> Ub : array<vec4<f32>>;   // stage target
+@group(1) @binding(2) var<storage, read>       Da : array<f32>;         // rho*Y
+@group(1) @binding(3) var<storage, read_write> Db : array<f32>;
+@group(1) @binding(4) var<storage, read_write> Fz : array<vec4<f32>>;
+@group(1) @binding(5) var<storage, read_write> Fr : array<vec4<f32>>;
+@group(1) @binding(6) var<storage, read_write> wav : array<vec2<f32>>;
+@group(1) @binding(7) var<storage, read_write> probeB : array<f32>;
+@group(1) @binding(8) var<storage, read>       Uold : array<vec4<f32>>; // U^n for RK stage 2
+@group(1) @binding(9) var<storage, read>       Dold : array<f32>;
+
+const FLUID : i32 = 0;
+const WALL  : i32 = 1;
+const PISTON: i32 = 2;
+/* Positivity floors, kept relative to the ambient state rather than absolute: an absolute
+   1 Pa floor is invisible for air at 101325 Pa but silently clamps a non-dimensional test. */
+fn GAM() -> f32 { return P.gas.x; }
+fn RHO_FLOOR() -> f32 { return 1.0e-6 * P.gas.y; }
+fn P_FLOOR() -> f32 { return 1.0e-6 * P.gas.z; }
+
+fn solidAt(p : vec2<f32>) -> i32 {
+  if (P.misc.z > 0.5) { return FLUID; }          // validation mode: empty domain
+  let z = p.x; let r = p.y;
+  if (z >= P.pist.x && z <= P.pist.y && r <= P.pist.z) { return PISTON; }
+  let outR = P.geoA.w + P.geoB.x;
+  if (z >= P.geoA.y && z <= P.geoA.z + P.geoB.z && r <= outR) {
+    var rin : f32;
+    let taper = P.geoB.w; let z1 = P.geoA.z;
+    if (z <= z1 - taper) { rin = P.geoA.w; }
+    else if (z <= z1) {
+      if (taper > 0.0) { rin = mix(P.geoA.w, P.geoB.y, (z - (z1 - taper)) / taper); }
+      else { rin = P.geoA.w; }
+    } else { rin = P.geoB.y; }
+    if (r >= rin) { return WALL; }
+  }
+  return FLUID;
+}
+fn solidCell(iz : i32, ir : i32) -> i32 {
+  return solidAt(vec2<f32>((f32(iz) + 0.5) * P.d.x, (f32(ir) + 0.5) * P.d.y));
+}
+fn cIdx(iz : i32, ir : i32) -> u32 {
+  let z = clamp(iz, 0, P.cells.x - 1);
+  let r = clamp(ir, 0, P.cells.y - 1);
+  return u32(r * P.cells.x + z);
+}
+fn Uat(iz : i32, ir : i32) -> vec4<f32> { return Ua[cIdx(iz, ir)]; }
+
+fn toPrim(u : vec4<f32>) -> vec4<f32> {          // -> (rho, uz, ur, p)
+  let rho = max(u.x, RHO_FLOOR());
+  let uz = u.y / rho; let ur = u.z / rho;
+  let p = max((GAM() - 1.0) * (u.w - 0.5 * rho * (uz * uz + ur * ur)), P_FLOOR());
+  return vec4<f32>(rho, uz, ur, p);
+}
+fn toCons(w : vec4<f32>) -> vec4<f32> {
+  return vec4<f32>(w.x, w.x * w.y, w.x * w.z,
+                   w.w / (GAM() - 1.0) + 0.5 * w.x * (w.y * w.y + w.z * w.z));
+}
+fn Wat(iz : i32, ir : i32) -> vec4<f32> { return toPrim(Uat(iz, ir)); }
+
+fn minmod(a : f32, b : f32) -> f32 {
+  if (a * b <= 0.0) { return 0.0; }
+  if (abs(a) < abs(b)) { return a; }
+  return b;
+}
+fn mm4(a : vec4<f32>, b : vec4<f32>) -> vec4<f32> {
+  return vec4<f32>(minmod(a.x, b.x), minmod(a.y, b.y), minmod(a.z, b.z), minmod(a.w, b.w));
+}
+
+/* HLLC, in a frame where .y is the wall-normal velocity and .z the tangential one. */
+fn hllc(wL : vec4<f32>, wR : vec4<f32>) -> vec4<f32> {
+  let g = GAM();
+  let rL = wL.x; let unL = wL.y; let utL = wL.z; let pL = wL.w;
+  let rR = wR.x; let unR = wR.y; let utR = wR.z; let pR = wR.w;
+  let aL = sqrt(g * pL / rL); let aR = sqrt(g * pR / rR);
+  let EL = pL / (g - 1.0) + 0.5 * rL * (unL * unL + utL * utL);
+  let ER = pR / (g - 1.0) + 0.5 * rR * (unR * unR + utR * utR);
+  let SL = min(unL - aL, unR - aR);
+  let SR = max(unL + aL, unR + aR);
+  if (SL >= 0.0) {
+    return vec4<f32>(rL * unL, rL * unL * unL + pL, rL * unL * utL, (EL + pL) * unL);
+  }
+  if (SR <= 0.0) {
+    return vec4<f32>(rR * unR, rR * unR * unR + pR, rR * unR * utR, (ER + pR) * unR);
+  }
+  let den = rL * (SL - unL) - rR * (SR - unR);
+  var Ss = 0.0;
+  if (abs(den) > 1e-12) {
+    Ss = (pR - pL + rL * unL * (SL - unL) - rR * unR * (SR - unR)) / den;
+  }
+  if (Ss >= 0.0) {
+    let FL = vec4<f32>(rL * unL, rL * unL * unL + pL, rL * unL * utL, (EL + pL) * unL);
+    let f = rL * (SL - unL) / (SL - Ss);
+    let Us = vec4<f32>(f, f * Ss, f * utL,
+              f * (EL / rL + (Ss - unL) * (Ss + pL / (rL * (SL - unL)))));
+    return FL + SL * (Us - vec4<f32>(rL, rL * unL, rL * utL, EL));
+  }
+  let FR = vec4<f32>(rR * unR, rR * unR * unR + pR, rR * unR * utR, (ER + pR) * unR);
+  let f = rR * (SR - unR) / (SR - Ss);
+  let Us = vec4<f32>(f, f * Ss, f * utR,
+            f * (ER / rR + (Ss - unR) * (Ss + pR / (rR * (SR - unR)))));
+  return FR + SR * (Us - vec4<f32>(rR, rR * unR, rR * utR, ER));
+}
+
+/* Thornber's low-Mach reconstruction fix. Plain upwinding has dissipation that
+   grows like 1/M; without this the vortex ring dissolves at the Mach numbers
+   this device actually runs at. */
+fn lowMach(wL : ptr<function, vec4<f32>>, wR : ptr<function, vec4<f32>>) {
+  let g = GAM();
+  let aL = sqrt(g * (*wL).w / (*wL).x);
+  let aR = sqrt(g * (*wR).w / (*wR).x);
+  let ML = length(vec2<f32>((*wL).y, (*wL).z)) / aL;
+  let MR = length(vec2<f32>((*wR).y, (*wR).z)) / aR;
+  let zf = min(1.0, max(ML, MR));
+  let un = 0.5 * ((*wL).y + (*wR).y); let dn = 0.5 * ((*wL).y - (*wR).y) * zf;
+  let ut = 0.5 * ((*wL).z + (*wR).z); let dt2 = 0.5 * ((*wL).z - (*wR).z) * zf;
+  (*wL).y = un + dn; (*wR).y = un - dn;
+  (*wL).z = ut + dt2; (*wR).z = ut - dt2;
+}
+
+/* A wall is handled by reflecting the fluid state through it and letting the
+   Riemann solver produce the flux. For the piston the reflection is about the
+   wall's own velocity, which gives the moving-wall pressure work for free. */
+fn reflectN(w : vec4<f32>, vwall : f32) -> vec4<f32> {
+  return vec4<f32>(w.x, 2.0 * vwall - w.y, w.z, w.w);
+}
+`;
+
+const WGSL_COMP_K = WGSL_COMP + `
+fn wallVelZ(s : i32) -> f32 { if (s == PISTON) { return P.pist.w; } return 0.0; }
+
+/* ---- axial faces: iz in [0, Nz], ir in [0, Nr) ---- */
+@compute @workgroup_size(64, 1)
+fn fluxZ(@builtin(global_invocation_id) g : vec3<u32>) {
+  let iz = i32(g.x); let ir = i32(g.y);
+  if (iz > P.cells.x || ir >= P.cells.y) { return; }
+  let fi = u32(ir * (P.cells.x + 1) + iz);
+
+  var sL = WALL; var sR = WALL;
+  if (iz > 0)            { sL = solidCell(iz - 1, ir); }
+  if (iz < P.cells.x)    { sR = solidCell(iz, ir); }
+  if (iz == 0)           { sL = solidCell(0, ir); }             // open end: mirror the interior
+  if (iz == P.cells.x)   { sR = solidCell(P.cells.x - 1, ir); }
+
+  if (sL != FLUID && sR != FLUID) { Fz[fi] = vec4<f32>(0.0); return; }
+
+  var wL : vec4<f32>; var wR : vec4<f32>;
+  if (sL != FLUID) {                                   // wall on the left
+    wR = Wat(iz, ir);
+    wL = reflectN(wR, wallVelZ(sL));
+  } else if (sR != FLUID) {                            // wall on the right
+    wL = Wat(iz - 1, ir);
+    wR = reflectN(wL, wallVelZ(sR));
+  } else if (iz == 0 || iz == P.cells.x) {             // open boundary: zero gradient
+    let w = Wat(min(iz, P.cells.x - 1), ir);
+    wL = w; wR = w;
+  } else {
+    let wm1 = Wat(iz - 1, ir); let w0 = Wat(iz, ir);
+    var wm2 = Wat(iz - 2, ir); var wp1 = Wat(iz + 1, ir);
+    if (iz - 2 < 0 || solidCell(iz - 2, ir) != FLUID) { wm2 = wm1; }
+    if (iz + 1 >= P.cells.x || solidCell(iz + 1, ir) != FLUID) { wp1 = w0; }
+    wL = wm1 + 0.5 * mm4(wm1 - wm2, w0 - wm1);
+    wR = w0  - 0.5 * mm4(w0 - wm1, wp1 - w0);
+    lowMach(&wL, &wR);
+  }
+  wL.x = max(wL.x, RHO_FLOOR()); wR.x = max(wR.x, RHO_FLOOR());
+  wL.w = max(wL.w, P_FLOOR());   wR.w = max(wR.w, P_FLOOR());
+  Fz[fi] = hllc(wL, wR);
+}
+
+/* ---- radial faces: iz in [0, Nz), ir in [0, Nr] ---- */
+@compute @workgroup_size(64, 1)
+fn fluxR(@builtin(global_invocation_id) g : vec3<u32>) {
+  let iz = i32(g.x); let ir = i32(g.y);
+  if (iz >= P.cells.x || ir > P.cells.y) { return; }
+  let fi = u32(ir * P.cells.x + iz);
+  if (ir == 0) { Fr[fi] = vec4<f32>(0.0); return; }     // axis: face area is zero
+
+  var sL = WALL; var sR = WALL;
+  if (ir > 0)          { sL = solidCell(iz, ir - 1); }
+  if (ir < P.cells.y)  { sR = solidCell(iz, ir); }
+  if (ir == P.cells.y) { sR = solidCell(iz, P.cells.y - 1); }
+
+  if (sL != FLUID && sR != FLUID) { Fr[fi] = vec4<f32>(0.0); return; }
+
+  var wL : vec4<f32>; var wR : vec4<f32>;
+  if (sL != FLUID) {
+    wR = Wat(iz, ir).xzyw;                             // (rho, ur, uz, p): normal first
+    wL = reflectN(wR, 0.0);                            // every radial wall here is static
+  } else if (sR != FLUID) {
+    wL = Wat(iz, ir - 1).xzyw;
+    wR = reflectN(wL, 0.0);
+  } else if (ir == P.cells.y) {
+    let w = Wat(iz, P.cells.y - 1).xzyw;
+    wL = w; wR = w;
+  } else {
+    let wm1 = Wat(iz, ir - 1).xzyw; let w0 = Wat(iz, ir).xzyw;
+    var wm2 = Wat(iz, ir - 2).xzyw; var wp1 = Wat(iz, ir + 1).xzyw;
+    if (ir - 2 < 0 || solidCell(iz, ir - 2) != FLUID) { wm2 = wm1; }
+    if (ir + 1 >= P.cells.y || solidCell(iz, ir + 1) != FLUID) { wp1 = w0; }
+    wL = wm1 + 0.5 * mm4(wm1 - wm2, w0 - wm1);
+    wR = w0  - 0.5 * mm4(w0 - wm1, wp1 - w0);
+    lowMach(&wL, &wR);
+  }
+  wL.x = max(wL.x, RHO_FLOOR()); wR.x = max(wR.x, RHO_FLOOR());
+  wL.w = max(wL.w, P_FLOOR());   wR.w = max(wR.w, P_FLOOR());
+  Fr[fi] = hllc(wL, wR).xzyw;                          // back to (rho, rho*uz, rho*ur, E)
+}
+
+/* ---- viscous stress and conduction, central differences at cell centres ---- */
+fn muEff(iz : i32, ir : i32, rho : f32) -> f32 {
+  var nu = P.flu.x;
+  if (P.flu.w > 0.0) {                                  // Smagorinsky sub-grid
+    let dz = P.d.x; let dr = P.d.y;
+    let rc = (f32(ir) + 0.5) * dr;
+    let wp = Wat(iz + 1, ir); let wm = Wat(iz - 1, ir);
+    let wn = Wat(iz, ir + 1); let ws = Wat(iz, ir - 1);
+    let w0 = Wat(iz, ir);
+    let duzdz = (wp.y - wm.y) / (2.0 * dz);
+    let durdr = (wn.z - ws.z) / (2.0 * dr);
+    let duzdr = (wn.y - ws.y) / (2.0 * dr);
+    let durdz = (wp.z - wm.z) / (2.0 * dz);
+    let stt = w0.z / max(rc, 1e-6);
+    let srz = 0.5 * (duzdr + durdz);
+    let s2 = 2.0 * (duzdz * duzdz + durdr * durdr + stt * stt) + 4.0 * srz * srz;
+    let dd = sqrt(dz * dr);
+    nu = nu + P.flu.w * P.flu.w * dd * dd * sqrt(max(s2, 0.0));
+  }
+  return rho * nu;
+}
+
+@compute @workgroup_size(8, 8)
+fn update(@builtin(global_invocation_id) g : vec3<u32>) {
+  let iz = i32(g.x); let ir = i32(g.y);
+  if (iz >= P.cells.x || ir >= P.cells.y) { return; }
+  let k = u32(ir * P.cells.x + iz);
+  let dz = P.d.x; let dr = P.d.y; let dt = P.dtlz.x;
+  let rc = (f32(ir) + 0.5) * dr;
+  let s = solidCell(iz, ir);
+
+  if (s != FLUID) {
+    // Keep solid cells holding a plausible state so that a cell the piston uncovers
+    // starts from something sane rather than stale garbage.
+    var acc = vec2<f32>(0.0); var n = 0.0;
+    for (var q = 0; q < 4; q++) {
+      var jz = iz; var jr = ir;
+      if (q == 0) { jz = iz - 1; } else if (q == 1) { jz = iz + 1; }
+      else if (q == 2) { jr = ir - 1; } else { jr = ir + 1; }
+      if (jz >= 0 && jz < P.cells.x && jr >= 0 && jr < P.cells.y && solidCell(jz, jr) == FLUID) {
+        let w = Wat(jz, jr); acc = acc + vec2<f32>(w.x, w.w); n = n + 1.0;
+      }
+    }
+    var rho = P.gas.y; var pr = P.gas.z;
+    if (n > 0.0) { rho = acc.x / n; pr = acc.y / n; }
+    var vz = 0.0;
+    if (s == PISTON) { vz = P.pist.w; }
+    Ub[k] = toCons(vec4<f32>(rho, vz, 0.0, pr));
+    Db[k] = 0.0;
+    return;
+  }
+
+  let fzL = Fz[u32(ir * (P.cells.x + 1) + iz)];
+  let fzR = Fz[u32(ir * (P.cells.x + 1) + iz + 1)];
+  let frL = Fr[u32(ir * P.cells.x + iz)];
+  let frR = Fr[u32((ir + 1) * P.cells.x + iz)];
+  let rL = f32(ir) * dr; let rR = f32(ir + 1) * dr;
+
+  let w0 = Wat(iz, ir);
+  var L = -(fzR - fzL) / dz - (rR * frR - rL * frL) / (rc * dr);
+  L.z = L.z + w0.w / rc;                                // axisymmetric pressure source
+
+  // ---- viscous terms ----
+  if (P.flu.x > 0.0 || P.flu.w > 0.0) {
+    let mu = muEff(iz, ir, w0.x);
+    let wp = Wat(iz + 1, ir); let wm = Wat(iz - 1, ir);
+    let wn = Wat(iz, ir + 1); let ws = Wat(iz, ir - 1);
+    let dz2 = dz * dz; let dr2 = dr * dr;
+    let lapz = (wp.y - 2.0 * w0.y + wm.y) / dz2
+             + ((rR * (wn.y - w0.y) - rL * (w0.y - ws.y)) / (rc * dr2));
+    let lapr = (wp.z - 2.0 * w0.z + wm.z) / dz2
+             + ((rR * (wn.z - w0.z) - rL * (w0.z - ws.z)) / (rc * dr2))
+             - w0.z / (rc * rc);
+    L.y = L.y + mu * lapz;
+    L.z = L.z + mu * lapr;
+    // viscous heating plus conduction (Pr constant, cp = gamma R / (gamma - 1))
+    let duzdz = (wp.y - wm.y) / (2.0 * dz);
+    let durdr = (wn.z - ws.z) / (2.0 * dr);
+    let duzdr = (wn.y - ws.y) / (2.0 * dr);
+    let durdz = (wp.z - wm.z) / (2.0 * dz);
+    let divu = duzdz + durdr + w0.z / rc;
+    let phi = mu * (2.0 * (duzdz * duzdz + durdr * durdr + (w0.z / rc) * (w0.z / rc))
+                    + (duzdr + durdz) * (duzdr + durdz) - (2.0 / 3.0) * divu * divu);
+    let Rg = 287.0;
+    let cp = P.gas.x * Rg / (P.gas.x - 1.0);
+    let kt = mu * cp / P.gas2.w;
+    let T0c = w0.w / (w0.x * Rg);
+    let Tp = wp.w / (wp.x * Rg); let Tm = wm.w / (wm.x * Rg);
+    let Tn = wn.w / (wn.x * Rg); let Ts = ws.w / (ws.x * Rg);
+    let lapT = (Tp - 2.0 * T0c + Tm) / dz2
+             + ((rR * (Tn - T0c) - rL * (T0c - Ts)) / (rc * dr2));
+    L.w = L.w + phi + kt * lapT + mu * (w0.y * lapz + w0.z * lapr);
+  }
+
+  let wgt = P.gas.w;
+  var Un = (1.0 - wgt) * (Ua[k] + dt * L) + wgt * Uold[k];
+
+  // ---- passive tracer, carried by the mass flux with an upwind mass fraction ----
+  let Yl = Da[cIdx(iz - 1, ir)] / max(Wat(iz - 1, ir).x, RHO_FLOOR());
+  let Y0 = Da[k] / max(w0.x, RHO_FLOOR());
+  let Yr = Da[cIdx(iz + 1, ir)] / max(Wat(iz + 1, ir).x, RHO_FLOOR());
+  let Yd = Da[cIdx(iz, ir - 1)] / max(Wat(iz, ir - 1).x, RHO_FLOOR());
+  let Yu = Da[cIdx(iz, ir + 1)] / max(Wat(iz, ir + 1).x, RHO_FLOOR());
+  var yzL = Y0; if (fzL.x >= 0.0) { yzL = Yl; }
+  var yzR = Y0; if (fzR.x <  0.0) { yzR = Yr; }
+  var yrL = Y0; if (frL.x >= 0.0) { yrL = Yd; }
+  var yrR = Y0; if (frR.x <  0.0) { yrR = Yu; }
+  let Ld = -(fzR.x * yzR - fzL.x * yzL) / dz
+           - (rR * frR.x * yrR - rL * frL.x * yrL) / (rc * dr);
+  var Dn = (1.0 - wgt) * (Da[k] + dt * Ld) + wgt * Dold[k];
+  Dn = Dn * exp(-P.flu.z * dt);
+
+  // ---- sponge: absorb outgoing acoustics so the open boundaries do not ring ----
+  let sz = P.gas2.y; let sr = P.gas2.z;
+  let zc = (f32(iz) + 0.5) * dz;
+  var sig = 0.0;
+  if (zc < sz)                { sig = max(sig, 1.0 - zc / sz); }
+  if (zc > P.dtlz.y - sz)     { sig = max(sig, 1.0 - (P.dtlz.y - zc) / sz); }
+  if (rc > P.geoA.x - sr)     { sig = max(sig, 1.0 - (P.geoA.x - rc) / sr); }
+  if (sig > 0.0) {
+    let amb = toCons(vec4<f32>(P.gas.y, 0.0, 0.0, P.gas.z));
+    let a = clamp(sig * sig * dt * P.gas2.x / max(sz, 1e-6), 0.0, 1.0);
+    Un = mix(Un, amb, a);
+    Dn = mix(Dn, 0.0, a);
+  }
+
+  Un.x = max(Un.x, RHO_FLOOR());
+  Ub[k] = Un;
+  Db[k] = clamp(Dn, 0.0, Un.x);
+}
+
+@compute @workgroup_size(8, 8)
+fn waveSpeed(@builtin(global_invocation_id) g : vec3<u32>) {
+  let iz = i32(g.x); let ir = i32(g.y);
+  if (iz >= P.cells.x || ir >= P.cells.y) { return; }
+  let k = u32(ir * P.cells.x + iz);
+  if (solidCell(iz, ir) != FLUID) { wav[k] = vec2<f32>(0.0); return; }
+  let w = toPrim(Ua[k]);
+  let a = sqrt(P.gas.x * w.w / w.x);
+  let sp = (abs(w.y) + a) / P.d.x + (abs(w.z) + a) / P.d.y;
+  let mach = length(vec2<f32>(w.y, w.z)) / a;
+  wav[k] = vec2<f32>(sp, mach);
+}
+
+@compute @workgroup_size(8, 8)
+fn initState(@builtin(global_invocation_id) g : vec3<u32>) {
+  let iz = i32(g.x); let ir = i32(g.y);
+  if (iz >= P.cells.x || ir >= P.cells.y) { return; }
+  let k = u32(ir * P.cells.x + iz);
+  let p = vec2<f32>((f32(iz) + 0.5) * P.d.x, (f32(ir) + 0.5) * P.d.y);
+  Ub[k] = toCons(vec4<f32>(P.gas.y, 0.0, 0.0, P.gas.z));
+  let inBarrel = solidAt(p) == FLUID && p.x > P.geoA.y && p.x < P.geoA.z + P.geoB.z
+                 && p.y < P.geoA.w;
+  var d = 0.0;
+  if (inBarrel) { d = P.gas.y; }
+  Db[k] = d;
+}
+
+@compute @workgroup_size(64)
+fn probeGather(@builtin(global_invocation_id) g : vec3<u32>) {
+  let ir = i32(g.x);
+  if (ir >= P.cells.y) { return; }
+  let iz = clamp(i32(P.misc.y), 0, P.cells.x - 1);
+  let w = toPrim(Ua[u32(ir * P.cells.x + iz)]);
+  probeB[u32(ir)] = w.y;
+}
+
+/* Seeding tracer just ahead of the piston face while it is pushing. */
+@compute @workgroup_size(8, 8)
+fn seedDye(@builtin(global_invocation_id) g : vec3<u32>) {
+  let iz = i32(g.x); let ir = i32(g.y);
+  if (iz >= P.cells.x || ir >= P.cells.y) { return; }
+  if (i32(P.misc.x) != 1) { return; }
+  let k = u32(ir * P.cells.x + iz);
+  let p = vec2<f32>((f32(iz) + 0.5) * P.d.x, (f32(ir) + 0.5) * P.d.y);
+  if (p.y <= P.pist.z && p.x >= P.pist.y && p.x <= P.pist.y + 3.0 && solidAt(p) == FLUID) {
+    Db[k] = toPrim(Ub[k]).x;
+  }
+}
+`;
+
+const WGSL_COMP_SHOW = `
+struct Params {
+  cells : vec2<i32>, faces : vec2<i32>, d : vec2<f32>, dtlz : vec2<f32>,
+  geoA : vec4<f32>, geoB : vec4<f32>, pist : vec4<f32>, flu : vec4<f32>,
+  misc : vec4<f32>, gas : vec4<f32>, gas2 : vec4<f32>,
+};
+@group(0) @binding(0) var<uniform> P : Params;
+@group(1) @binding(0) var<storage, read> Ua : array<vec4<f32>>;
+@group(1) @binding(1) var<storage, read> Da : array<f32>;
+struct Show { viewport : vec2<f32>, field : f32, scale : f32,
+              showGeom : f32, probeZ : f32, _p : vec2<f32> };
+@group(2) @binding(0) var<uniform> SH : Show;
+
+const FLUID : i32 = 0; const WALL : i32 = 1; const PISTON : i32 = 2;
+
+fn solidAt(p : vec2<f32>) -> i32 {
+  let z = p.x; let r = p.y;
+  if (z >= P.pist.x && z <= P.pist.y && r <= P.pist.z) { return PISTON; }
+  let outR = P.geoA.w + P.geoB.x;
+  if (z >= P.geoA.y && z <= P.geoA.z + P.geoB.z && r <= outR) {
+    var rin : f32; let taper = P.geoB.w; let z1 = P.geoA.z;
+    if (z <= z1 - taper) { rin = P.geoA.w; }
+    else if (z <= z1) {
+      if (taper > 0.0) { rin = mix(P.geoA.w, P.geoB.y, (z - (z1 - taper)) / taper); }
+      else { rin = P.geoA.w; }
+    } else { rin = P.geoB.y; }
+    if (r >= rin) { return WALL; }
+  }
+  return FLUID;
+}
+fn cIdx(iz : i32, ir : i32) -> u32 {
+  return u32(clamp(ir, 0, P.cells.y - 1) * P.cells.x + clamp(iz, 0, P.cells.x - 1));
+}
+fn prim(iz : i32, ir : i32) -> vec4<f32> {
+  let u = Ua[cIdx(iz, ir)];
+  let rho = max(u.x, 1.0e-4);
+  let uz = u.y / rho; let ur = u.z / rho;
+  let p = max((P.gas.x - 1.0) * (u.w - 0.5 * rho * (uz * uz + ur * ur)), 1.0);
+  return vec4<f32>(rho, uz, ur, p);
+}
+@vertex fn vs(@builtin(vertex_index) vi : u32) -> @builtin(position) vec4<f32> {
+  let v = vec2<f32>(f32((vi << 1u) & 2u), f32(vi & 2u));
+  return vec4<f32>(v * 2.0 - 1.0, 0.0, 1.0);
+}
+fn viridis(t0 : f32) -> vec3<f32> {
+  let t = clamp(t0, 0.0, 1.0);
+  let c0=vec3<f32>(0.2777,0.0054,0.3341); let c1=vec3<f32>(0.1051,1.4046,1.3846);
+  let c2=vec3<f32>(-0.3309,0.2148,0.0951); let c3=vec3<f32>(-4.6342,-5.7991,-19.3324);
+  let c4=vec3<f32>(6.2283,14.1799,56.6906); let c5=vec3<f32>(4.7764,-13.7451,-65.3530);
+  let c6=vec3<f32>(-5.4355,4.6459,26.3124);
+  return clamp(c0+t*(c1+t*(c2+t*(c3+t*(c4+t*(c5+t*c6))))), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+fn diverging(t : f32) -> vec3<f32> {
+  let a = clamp(abs(t), 0.0, 1.0);
+  var c = vec3<f32>(1.0, 0.42, 0.25);
+  if (t < 0.0) { c = vec3<f32>(0.25, 0.55, 1.0); }
+  return mix(vec3<f32>(0.055, 0.07, 0.09), c, pow(a, 0.75));
+}
+@fragment fn fs(@builtin(position) fc : vec4<f32>) -> @location(0) vec4<f32> {
+  let uv = vec2<f32>(fc.x / SH.viewport.x, 1.0 - fc.y / SH.viewport.y);
+  let z = uv.x * P.dtlz.y;
+  let rs = (uv.y - 0.5) * 2.0 * P.geoA.x;
+  let r = abs(rs);
+  let p2 = vec2<f32>(z, r);
+  let iz = clamp(i32(floor(z / P.d.x)), 0, P.cells.x - 1);
+  let ir = clamp(i32(floor(r / P.d.y)), 0, P.cells.y - 1);
+  var col = vec3<f32>(0.055, 0.07, 0.09);
+  let sld = solidAt(p2);
+  let fld = i32(SH.field);
+  if (sld == FLUID) {
+    let w = prim(iz, ir);
+    let a = sqrt(P.gas.x * w.w / w.x);
+    let dye = clamp(Da[cIdx(iz, ir)] / w.x, 0.0, 1.0);
+    if (fld == 0) {
+      col = mix(col, vec3<f32>(0.86, 0.93, 1.0), pow(dye, 0.7));
+    } else if (fld == 1) {
+      col = viridis(length(vec2<f32>(w.y, w.z)) / max(SH.scale, 1e-6));
+    } else if (fld == 2) {
+      let wp = prim(iz + 1, ir); let wm = prim(iz - 1, ir);
+      let wn = prim(iz, ir + 1); let ws = prim(iz, ir - 1);
+      let vort = (wp.z - wm.z) / (2.0 * P.d.x) - (wn.y - ws.y) / (2.0 * P.d.y);
+      var sgn = 1.0; if ((uv.y - 0.5) < 0.0) { sgn = -1.0; }
+      col = diverging(clamp(sgn * vort / max(SH.scale, 1e-6), -1.0, 1.0));
+    } else if (fld == 3) {
+      col = diverging(clamp((w.w - P.gas.z) / max(SH.scale, 1e-6), -1.0, 1.0));
+    } else if (fld == 4) {
+      col = diverging(clamp(w.y / max(SH.scale, 1e-6), -1.0, 1.0));
+    } else if (fld == 5) {
+      // Mach, with a hard line at M = 1 so choking is visible
+      let M = length(vec2<f32>(w.y, w.z)) / a;
+      col = viridis(M / max(SH.scale, 1e-6));
+      if (abs(M - 1.0) < 0.02) { col = vec3<f32>(1.0, 1.0, 1.0); }
+    } else {
+      // numerical schlieren: exp(-k |grad rho| / max) is how shocks are shown in practice
+      let gz = (prim(iz + 1, ir).x - prim(iz - 1, ir).x) / (2.0 * P.d.x);
+      let gr = (prim(iz, ir + 1).x - prim(iz, ir - 1).x) / (2.0 * P.d.y);
+      let s = length(vec2<f32>(gz, gr)) / max(SH.scale, 1e-6);
+      let v = 1.0 - exp(-3.0 * s);
+      col = vec3<f32>(v, v, v);
+    }
+    if (fld != 0 && fld != 6) { col = mix(col, vec3<f32>(1.0), 0.16 * dye); }
+  } else if (SH.showGeom > 0.5) {
+    if (sld == PISTON) { col = vec3<f32>(0.83, 0.55, 0.20); }
+    else { col = vec3<f32>(0.30, 0.35, 0.42); }
+    if (fract((z * 0.5 + r * 0.5) / 3.0) < 0.5) { col = col + 0.04; }
+  } else { col = vec3<f32>(0.10, 0.11, 0.13); }
+  if (abs(uv.y - 0.5) * SH.viewport.y < 0.6) { col = mix(col, vec3<f32>(0.45,0.55,0.65), 0.5); }
+  if (abs(z - SH.probeZ) < P.d.x * 0.6) { col = mix(col, vec3<f32>(1.0,0.85,0.35), 0.45); }
+  return vec4<f32>(col, 1.0);
+}
+`;
+
+/* ========================== compressible driver ========================== */
+const CP = { ok:false, idx:0, machMax:0, waveMax:1 };
+
+async function compInit(){
+  if (!WG.dev) return false;
+  const dev = WG.dev;
+  const modK = dev.createShaderModule({ code: WGSL_COMP_K });
+  const modS = dev.createShaderModule({ code: WGSL_COMP_SHOW });
+  for (const m of [modK, modS]){
+    const info = await m.getCompilationInfo();
+    const bad = info.messages.filter(x => x.type === 'error');
+    if (bad.length){
+      console.error('compressible shader:', bad);
+      wgpuFail('compressible kernels: ' + bad[0].message);
+      return false;
+    }
+  }
+  const st = (b, ro) => ({ binding:b, visibility:GPUShaderStage.COMPUTE,
+                           buffer:{ type: ro ? 'read-only-storage' : 'storage' } });
+  CP.bglF = dev.createBindGroupLayout({ entries:[
+    st(0,true), st(1,false), st(2,true), st(3,false), st(4,false),
+    st(5,false), st(6,false), st(7,false), st(8,true), st(9,true) ] });
+  const sr = b => ({ binding:b, visibility:GPUShaderStage.FRAGMENT,
+                     buffer:{ type:'read-only-storage' } });
+  CP.bglS = dev.createBindGroupLayout({ entries:[ sr(0), sr(1) ] });
+
+  const plK = dev.createPipelineLayout({ bindGroupLayouts:[WG.bglP, CP.bglF] });
+  const plS = dev.createPipelineLayout({ bindGroupLayouts:[WG.bglP, CP.bglS, WG.bglS] });
+  CP.pipe = {};
+  for (const n of ['fluxZ','fluxR','update','waveSpeed','initState','probeGather','seedDye'])
+    CP.pipe[n] = dev.createComputePipeline({ layout:plK, compute:{ module:modK, entryPoint:n } });
+  CP.pipe.show = dev.createRenderPipeline({ layout:plS,
+    vertex:{ module:modS, entryPoint:'vs' },
+    fragment:{ module:modS, entryPoint:'fs', targets:[{ format:WG.fmt }] },
+    primitive:{ topology:'triangle-list' } });
+  CP.ok = true;
+  return true;
+}
+
+function compAlloc(){
+  const dev = WG.dev;
+  for (const k in (CP.buf || {})) if (CP.buf[k] && CP.buf[k].destroy) CP.buf[k].destroy();
+  CP.buf = {};
+  const nC = S.Nz * S.Nr;
+  const SU = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
+  const mk = (n, b) => dev.createBuffer({ size: Math.max(16, n * b), usage: SU });
+  const B = CP.buf;
+  B.U = [mk(nC,16), mk(nC,16), mk(nC,16)];
+  B.D = [mk(nC,4),  mk(nC,4),  mk(nC,4)];
+  B.Fz = mk((S.Nz + 1) * S.Nr, 16);
+  B.Fr = mk(S.Nz * (S.Nr + 1), 16);
+  B.wav = mk(nC, 8);
+  B.probe = mk(S.Nr, 4);
+
+  CP.bg = [];
+  for (let i = 0; i < 3; i++){
+    const a = i, b = (i + 1) % 3, c = (i + 2) % 3;
+    const mkbg = (src, dst) => dev.createBindGroup({ layout:CP.bglF, entries:[
+      { binding:0, resource:{ buffer:B.U[src] } }, { binding:1, resource:{ buffer:B.U[dst] } },
+      { binding:2, resource:{ buffer:B.D[src] } }, { binding:3, resource:{ buffer:B.D[dst] } },
+      { binding:4, resource:{ buffer:B.Fz } },     { binding:5, resource:{ buffer:B.Fr } },
+      { binding:6, resource:{ buffer:B.wav } },    { binding:7, resource:{ buffer:B.probe } },
+      { binding:8, resource:{ buffer:B.U[a] } },   { binding:9, resource:{ buffer:B.D[a] } } ]});
+    CP.bg.push([mkbg(a, b), mkbg(b, c)]);
+  }
+  CP.bgS = [0,1,2].map(i => dev.createBindGroup({ layout:CP.bglS, entries:[
+    { binding:0, resource:{ buffer:B.U[i] } }, { binding:1, resource:{ buffer:B.D[i] } } ]}));
+
+  // reduction chain over cells (the incompressible one is sized for faces)
+  CP.red = [];
+  let n = nC;
+  while (n > 1){
+    const outN = Math.ceil(n / 256);
+    CP.red.push({ n, out: mk(outN, 8) });
+    n = outN;
+  }
+  const rp = new Uint32Array(PARAM_STRIDE * Math.max(1, CP.red.length) / 4);
+  CP.red.forEach((L, i) => { rp[i * PARAM_FLOATS] = L.n; rp[i * PARAM_FLOATS + 1] = 0; });
+  B.redParams = dev.createBuffer({ size: PARAM_STRIDE * Math.max(1, CP.red.length),
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  dev.queue.writeBuffer(B.redParams, 0, rp);
+  CP.bgRP = dev.createBindGroup({ layout:WG.bglRP, entries:[
+    { binding:0, resource:{ buffer:B.redParams, size:16 } }] });
+  CP.bgRed = CP.red.map((L, i) => dev.createBindGroup({ layout:WG.bglR, entries:[
+    { binding:0, resource:{ buffer: i === 0 ? B.wav : CP.red[i-1].out } },
+    { binding:1, resource:{ buffer:L.out } }]}));
+
+  CP.stageMax   = dev.createBuffer({ size:8, usage:GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  CP.stageProbe = dev.createBuffer({ size:Math.max(16, S.Nr * 4),
+    usage:GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  CP.mapBusy = false;
+  CP.gen = (CP.gen || 0) + 1;
+  CP.idx = 0;
+  CP.waveMax = AIR.a0 * (1 / S.dz + 1 / S.dr);
+  CP.machMax = 0;
+}
+
+const CTEST = { noGeom:false, noSponge:false, rho0:null, p0:null };
+function compParams(slot, dt, weight){
+  wgpuParams(slot, dt);                       // shared geometry / drive / fluid block
+  const F = WG.paramF, o = slot * PARAM_FLOATS;
+  F[o+26] = CTEST.noGeom ? 1 : 0;
+  F[o+28] = AIR.gamma;
+  F[o+29] = CTEST.rho0 !== null ? CTEST.rho0 : AIR.rho0;
+  F[o+30] = CTEST.p0   !== null ? CTEST.p0   : AIR.p0;
+  F[o+31] = weight;
+  F[o+32] = AIR.a0;
+  F[o+33] = CTEST.noSponge ? 0 : 0.08 * S.Lz;
+  F[o+34] = CTEST.noSponge ? 0 : 0.12 * S.Rmax;
+  F[o+35] = AIR.Pr;
+}
+
+function compChooseDt(){
+  const cfl = Math.min(P.cfl, 0.6);           // MUSCL + SSP-RK2 acoustic limit
+  return Math.min(0.5, cfl / Math.max(CP.waveMax, 1e-6));
+}
+
+function compReset(){
+  const dev = WG.dev;
+  compParams(0, 0.001, 0);
+  dev.queue.writeBuffer(CP.buf.params || WG.buf.params, 0, WG.paramHost, 0, PARAM_STRIDE);
+  const enc = dev.createCommandEncoder();
+  const pass = enc.beginComputePass();
+  pass.setBindGroup(0, WG.bgP, [0]);
+  pass.setPipeline(CP.pipe.initState);
+  for (let i = 0; i < 3; i++){
+    pass.setBindGroup(1, CP.bg[i][0]);
+    pass.dispatchWorkgroups(Math.ceil(S.Nz / 8), Math.ceil(S.Nr / 8));
+  }
+  pass.end();
+  dev.queue.submit([enc.finish()]);
+  CP.idx = 0;
+  CP.waveMax = AIR.a0 * (1 / S.dz + 1 / S.dr);
+  CP.machMax = 0;
+}
+
+function compSteps(n){
+  const dev = WG.dev, B = CP.buf;
+  n = Math.min(n, 1024);
+  const dts = [];
+  let tSim = S.t, simmed = 0;
+  const sT = S.t, sX = S.pistonX, sV = S.pistonV, sF = S.firing;
+  for (let i = 0; i < n; i++){
+    S.t = tSim;
+    const k = pistonKinematics(tSim);
+    S.pistonX = k.x; S.pistonV = k.v; S.firing = tSim < P.pushMs;
+    const dt = compChooseDt();
+    compParams(2 * i,     dt, 0.0);           // RK stage 1
+    compParams(2 * i + 1, dt, 0.5);           // RK stage 2
+    dts.push(dt); tSim += dt; simmed += dt;
+  }
+  S.t = sT; S.pistonX = sX; S.pistonV = sV; S.firing = sF;
+  dev.queue.writeBuffer(WG.buf.params, 0, WG.paramHost, 0, 2 * n * PARAM_STRIDE);
+
+  const gz = Math.ceil((S.Nz + 1) / 64), gzc = Math.ceil(S.Nz / 64);
+  const gc = [Math.ceil(S.Nz / 8), Math.ceil(S.Nr / 8)];
+  const enc = dev.createCommandEncoder();
+  const pass = enc.beginComputePass();
+
+  for (let i = 0; i < n; i++){
+    for (let stage = 0; stage < 2; stage++){
+      pass.setBindGroup(0, WG.bgP, [(2 * i + stage) * PARAM_STRIDE]);
+      pass.setBindGroup(1, CP.bg[CP.idx][stage]);
+      pass.setPipeline(CP.pipe.fluxZ);  pass.dispatchWorkgroups(gz, S.Nr);
+      pass.setPipeline(CP.pipe.fluxR);  pass.dispatchWorkgroups(gzc, S.Nr + 1);
+      pass.setPipeline(CP.pipe.update); pass.dispatchWorkgroups(gc[0], gc[1]);
+    }
+    pass.setPipeline(CP.pipe.seedDye);  pass.dispatchWorkgroups(gc[0], gc[1]);
+    CP.idx = (CP.idx + 2) % 3;
+  }
+
+  // wave speed and probe read the state that is now current
+  pass.setBindGroup(0, WG.bgP, [(2 * n - 1) * PARAM_STRIDE]);
+  pass.setBindGroup(1, CP.bg[CP.idx][0]);
+  pass.setPipeline(CP.pipe.waveSpeed);   pass.dispatchWorkgroups(gc[0], gc[1]);
+  pass.setPipeline(CP.pipe.probeGather); pass.dispatchWorkgroups(Math.ceil(S.Nr / 64));
+  pass.setPipeline(WG.pipe.reduceMax);
+  CP.red.forEach((L, i) => {
+    pass.setBindGroup(0, CP.bgRP, [i * PARAM_STRIDE]);
+    pass.setBindGroup(1, CP.bgRed[i]);
+    pass.dispatchWorkgroups(Math.ceil(L.n / 256));
+  });
+  pass.end();
+
+  const last = CP.red[CP.red.length - 1];
+  const sMax = CP.stageMax, sProbe = CP.stageProbe, gen = CP.gen;
+  if (!CP.mapBusy){
+    enc.copyBufferToBuffer(last.out, 0, sMax, 0, 8);
+    enc.copyBufferToBuffer(B.probe, 0, sProbe, 0, S.Nr * 4);
+  }
+  dev.queue.submit([enc.finish()]);
+
+  if (!CP.mapBusy){
+    CP.mapBusy = true;
+    const tag = S.t + simmed;
+    Promise.all([sMax.mapAsync(GPUMapMode.READ), sProbe.mapAsync(GPUMapMode.READ)]).then(() => {
+      const m  = new Float32Array(sMax.getMappedRange().slice(0));
+      const pr = new Float32Array(sProbe.getMappedRange().slice(0));
+      sMax.unmap(); sProbe.unmap();
+      if (gen !== CP.gen) return;
+      CP.mapBusy = false;
+      if (!Number.isFinite(m[0]) || m[0] <= 0){ flagDivergence(NaN); return; }
+      CP.waveMax = m[0];
+      CP.machMax = m[1];
+      S.vmax = CP.machMax * AIR.a0;
+      S.vzmax = S.vmax; S.vrmax = S.vmax;
+      consumeProbeArr(pr, tag);
+    }).catch(() => { if (gen === CP.gen) CP.mapBusy = false; });
+  }
+
+  S.t += simmed;
+  const k = pistonKinematics(S.t);
+  S.pistonX = k.x; S.pistonV = k.v; S.firing = S.t < P.pushMs;
+  return simmed;
+}
+
+function compRender(){
+  const dev = WG.dev, cv = WG.canvas;
+  const g = VIEW.gain;
+  let base;
+  switch (VIEW.field){
+    case 1: base = Math.max(S.vmax * 0.75, 1e-3); break;
+    case 2: base = Math.max(S.vmax / Math.min(S.dz, S.dr) * 0.12, 1e-3); break;
+    case 3: base = Math.max(AIR.rho0 * S.vmax * S.vmax, 50); break;   // dynamic pressure scale
+    case 4: base = Math.max(S.vmax * 0.75, 1e-3); break;
+    case 5: base = 1.4; break;                                        // Mach
+    case 6: base = Math.max(AIR.rho0 * 0.35 / Math.min(S.dz, S.dr), 1e-3); break;
+    default: base = 1;
+  }
+  const su = new Float32Array(8);
+  su[0] = cv.width; su[1] = cv.height; su[2] = VIEW.field; su[3] = base / g;
+  su[4] = VIEW.showGeom ? 1 : 0;
+  su[5] = Math.min(S.Lz - S.dz, S.Z1 + P.plateT + P.probe);
+  dev.queue.writeBuffer(WG.buf.showU, 0, su);
+  compParams(0, S.dt || 0.001, 0);
+  dev.queue.writeBuffer(WG.buf.params, 0, WG.paramHost, 0, PARAM_STRIDE);
+
+  const enc = dev.createCommandEncoder();
+  const pass = enc.beginRenderPass({ colorAttachments:[{
+    view: WG.ctx.getCurrentTexture().createView(),
+    clearValue:{ r:0.02, g:0.03, b:0.04, a:1 }, loadOp:'clear', storeOp:'store' }] });
+  pass.setPipeline(CP.pipe.show);
+  pass.setBindGroup(0, WG.bgP, [0]);
+  pass.setBindGroup(1, CP.bgS[CP.idx]);
+  pass.setBindGroup(2, WG.bgS);
+  pass.draw(3);
+  pass.end();
+  dev.queue.submit([enc.finish()]);
+}
+</script>
+
+<script>
+"use strict";
 /* ========================== control panel ========================== */
 const DOM = { scalebar: document.getElementById('scalebar'),
               pause:    document.getElementById('pause'),
@@ -1972,6 +2798,36 @@ for (const g of CONTROLS){
   host.appendChild(d);
 }
 
+/* ---- physical model selector ---- */
+{
+  const d = document.createElement('details');
+  d.open = true;
+  d.innerHTML = `<summary>Physical model</summary><div class="body">
+    <select id="modelSel">
+      <option value="auto">Auto — pick by exit Mach (recommended)</option>
+      <option value="incompressible">Incompressible (fast, valid below Mach 0.3)</option>
+      <option value="compressible">Compressible Navier–Stokes (valid at any speed)</option>
+    </select>
+    <div class="hint" id="modelWhy" style="margin-top:6px"></div></div>`;
+  host.appendChild(d);
+  d.querySelector('#modelSel').addEventListener('change', e => {
+    OPT.model = e.target.value; buildGrid(); updateMetrics();
+  });
+}
+function modelBlurb(){
+  const el = document.getElementById('modelWhy');
+  if (!el) return;
+  const D = derived();
+  if (!CP.ok){ el.innerHTML = 'WebGPU unavailable — only the incompressible solver is built.'; return; }
+  el.innerHTML =
+    `Running: <b>${S.activeModel}</b>. ` +
+    (S.activeModel === 'compressible'
+      ? `It carries real acoustics, so it shocks and chokes correctly, but the timestep is ` +
+        `set by the speed of sound — about 6× slower at low Mach.`
+      : `Density varies by under ${fmt(100*(1-Math.pow(1+0.2*D.mach*D.mach,-2.5)),1)}% at this ` +
+        `exit Mach, so the incompressible limit is accurate here and much faster.`);
+}
+
 /* ---- pacing toggle, appended to the solver section ---- */
 {
   const solver = [...host.querySelectorAll('details')]
@@ -1998,6 +2854,8 @@ for (const g of CONTROLS){
         <option value="2">Vorticity (ring cores)</option>
         <option value="3">Pressure</option>
         <option value="4">Axial velocity u_z</option>
+        <option value="5">Mach number (compressible only)</option>
+        <option value="6">Schlieren — shocks (compressible only)</option>
       </select></div>
     <div class="ctl"><div class="lab"><span>Colour gain</span><span id="v_gain">1.0×</span></div>
       <input type="range" id="s_gain" min="-1.2" max="1.5" step="0.02" value="0"></div>
@@ -2113,7 +2971,9 @@ function frame(){
     if (pendingRebuild){ buildGrid(); pendingRebuild = false; }
     let simmed = 0;
     const n = OPT.autoPace ? Math.max(1, Math.round(S.spfAuto)) : P.spf;
-    if (WG.ok){
+    if (usingComp()){
+      simmed = compSteps(n);
+    } else if (WG.ok){
       simmed = wgpuSteps(n);
     } else {
       for (let i = 0; i < n; i++){ const dt = chooseDt(); step(dt); simmed += dt; }
@@ -2170,9 +3030,12 @@ function frame(){
     (S.firing ? '   ▶ pushing' : '   ■ coasting') + `\n` +
     `${fps.toFixed(0)} fps   ${steps} steps/frame   ` +
     `${S.simRate.toFixed(1)} ms of flight per second\n` +
-    (WG.ok
-      ? `WebGPU compute   ${(steps*(7 + P.iters)).toLocaleString()} dispatches/frame, 1 submit`
-      : `WebGL2 fragment   ${(steps*(P.iters+6)).toLocaleString()} passes/frame @ ${S.passUs.toFixed(0)} µs`);
+    (usingComp()
+      ? `compressible Navier-Stokes (HLLC/MUSCL)   max Mach ${CP.machMax.toFixed(2)}   ` +
+        `${(steps*7).toLocaleString()} dispatches/frame`
+      : WG.ok
+        ? `incompressible   ${(steps*(7 + P.iters)).toLocaleString()} dispatches/frame, 1 submit`
+        : `incompressible, WebGL2   ${(steps*(P.iters+6)).toLocaleString()} passes @ ${S.passUs.toFixed(0)} µs`);
 
   requestAnimationFrame(frame);
 }
@@ -2193,7 +3056,9 @@ function flagDivergence(v){
   if (usedGPU){
     document.getElementById('view').style.display = 'none';
     WG.canvas.style.display = 'block';
+    await compInit();
   }
+  if (!CP.ok) OPT.model = 'incompressible';
   buildGrid();
   S.passUs = usedGPU ? 0 : measurePassCost();
   S.backend = usedGPU ? 'WebGPU compute' : 'WebGL2 fragment';
