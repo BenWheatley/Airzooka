@@ -72,6 +72,12 @@
   .btnrow button{flex:1 1 auto}
   .presets button{flex:1 1 45%; font-size:11.5px; text-align:left; padding:6px 8px; line-height:1.3}
   .presets button b{display:block; color:var(--accent); font-size:11.5px}
+  .presets button.active{background:#1d4763; border-color:#5ec6ff}
+  .pbar{height:6px; background:#0e1116; border:1px solid var(--line); border-radius:4px;
+        overflow:hidden; margin:8px 0 4px}
+  .pbar>div{height:100%; width:0%; background:linear-gradient(90deg,#2d6d95,#5ec6ff);
+            transition:width .12s linear}
+  .presets button.active b{color:#dff1ff}
   .presets button i{font-style:normal; color:var(--dim); font-size:10.5px}
   label.chk{display:flex; align-items:center; gap:6px; margin:6px 0; cursor:pointer}
   #note{font-size:11px; color:var(--dim); margin-top:10px; line-height:1.5}
@@ -488,8 +494,6 @@ void main(){
     } else {
       col = diverging(clamp(velCentre(c).x/max(uScale,1e-6), -1.0, 1.0));
     }
-    // faint dye wash over the physical fields so the slug stays visible
-    if (uField != 0) col = mix(col, vec3(1.0), 0.16*clamp(sampleDye(p),0.0,1.0));
   } else if (uShowGeom == 1){
     col = (s == PISTON) ? vec3(0.83,0.55,0.20) : vec3(0.30,0.35,0.42);
     float edge = mod(z*0.5 + r*0.5, 3.0) < 1.5 ? 0.04 : 0.0;   // subtle hatch
@@ -651,10 +655,7 @@ const CONTROLS = [
    { k:'vidFps',        t:'Video frame rate',   min:12, max:60, step:1, v:30, unit:'fps' },
    { k:'vidWidth',      t:'Video width',        min:480, max:1920, step:80, v:1280, unit:'px' },
    { k:'vidMbps',       t:'Bitrate',            min:1, max:40, step:1, v:12, unit:'Mb/s' },
-   { k:'vidPrepass',    t:'Fixed colour scale',  min:0, max:1, step:1, v:1,
-     hint:'Runs the shot once first to find the peak, so the colour range is identical in ' +
-          'every frame. Costs roughly double. With it off the range is frozen at whatever ' +
-          'the current frame shows — still constant, but probably a poor choice.' },
+
  ]},
  { group:'Measurement', items:[
    { k:'probe',      t:'Target distance from muzzle', min:10, max:1000, step:5, v:150, unit:'mm' },
@@ -685,7 +686,7 @@ const S = {
   spfAuto:8, wallSmooth:16, simRate:0, passUs:0, diverged:false,
 };
 var FIXED_DT = null, EXPORTING = false;
-const OPT = { autoPace:true, model:'auto' };
+const OPT = { autoPace:true, model:'auto', format:'mp4' };
 /* Neither model is right everywhere. Incompressible is exact-in-the-limit below about
    Mach 0.3 and roughly six times faster there, because it does not have to resolve
    acoustics. Compressible is right at any speed but pays a timestep set by the sound
@@ -1092,6 +1093,7 @@ function updateMetrics(){
     ]) + '</div>' +
     rest.map(([c,t]) => `<div class="flag ${c}">${t}</div>`).join('');
   modelBlurb();
+  markActiveQuality();
 }
 
 /* The colour scale was computed independently in three render paths, each from the live
@@ -1704,7 +1706,6 @@ fn fs(@builtin(position) fc : vec4<f32>) -> @location(0) vec4<f32> {
     } else {
       col = diverging(clamp(uzc / max(SH.scale, 1e-6), -1.0, 1.0));
     }
-    if (fld != 0) { col = mix(col, vec3<f32>(1.0), 0.16 * clamp(sampleDye(p), 0.0, 1.0)); }
   } else if (SH.showGeom > 0.5) {
     if (sld == PISTON) { col = vec3<f32>(0.83, 0.55, 0.20); }
     else { col = vec3<f32>(0.30, 0.35, 0.42); }
@@ -1714,6 +1715,8 @@ fn fs(@builtin(position) fc : vec4<f32>) -> @location(0) vec4<f32> {
   }
   if (abs(uv.y - 0.5) * SH.viewport.y < 0.6) { col = mix(col, vec3<f32>(0.45, 0.55, 0.65), 0.5); }
   if (abs(z - SH.probeZ) < P.d.x * 0.6) { col = mix(col, vec3<f32>(1.0, 0.85, 0.35), 0.45); }
+  // export reads the texture as raw bytes; emitting BGR here saves swizzling every pixel in JS
+  if (SH._pad.x > 0.5) { col = col.bgr; }
   return vec4<f32>(col, 1.0);
 }
 `;
@@ -2062,6 +2065,7 @@ function wgpuRender(targetView, outW, outH){
   su[0] = outW || w; su[1] = outH || h; su[2] = VIEW.field; su[3] = S.colourScale;
   su[4] = VIEW.showGeom ? 1 : 0;
   su[5] = Math.min(S.Lz - S.dz, S.Z1 + P.plateT + P.probe);
+  su[6] = (EXPORTING && WG.fmt === 'bgra8unorm') ? 1 : 0;
   dev.queue.writeBuffer(WG.buf.showU, 0, su);
 
   const enc = dev.createCommandEncoder();
@@ -2618,7 +2622,6 @@ fn diverging(t : f32) -> vec3<f32> {
       let v = 1.0 - exp(-3.0 * s);
       col = vec3<f32>(v, v, v);
     }
-    if (fld != 0 && fld != 6) { col = mix(col, vec3<f32>(1.0), 0.16 * dye); }
   } else if (SH.showGeom > 0.5) {
     if (sld == PISTON) { col = vec3<f32>(0.83, 0.55, 0.20); }
     else { col = vec3<f32>(0.30, 0.35, 0.42); }
@@ -2626,6 +2629,8 @@ fn diverging(t : f32) -> vec3<f32> {
   } else { col = vec3<f32>(0.10, 0.11, 0.13); }
   if (abs(uv.y - 0.5) * SH.viewport.y < 0.6) { col = mix(col, vec3<f32>(0.45,0.55,0.65), 0.5); }
   if (abs(z - SH.probeZ) < P.d.x * 0.6) { col = mix(col, vec3<f32>(1.0,0.85,0.35), 0.45); }
+  // export reads the texture as raw bytes; emitting BGR here saves swizzling every pixel in JS
+  if (SH._p.x > 0.5) { col = col.bgr; }
   return vec4<f32>(col, 1.0);
 }
 `;
@@ -2854,6 +2859,7 @@ function compRender(targetView, outW, outH){
   su[0] = outW || cv.width; su[1] = outH || cv.height; su[2] = VIEW.field; su[3] = S.colourScale;
   su[4] = VIEW.showGeom ? 1 : 0;
   su[5] = Math.min(S.Lz - S.dz, S.Z1 + P.plateT + P.probe);
+  su[6] = (EXPORTING && WG.fmt === 'bgra8unorm') ? 1 : 0;
   dev.queue.writeBuffer(WG.buf.showU, 0, su);
   compParams(0, S.dt || 0.001, 0);
   dev.queue.writeBuffer(WG.buf.params, 0, WG.paramHost, 0, PARAM_STRIDE);
@@ -2978,6 +2984,94 @@ function webmMux(frames, width, height, fps, codecId){
   return new Blob([header, segment], { type:'video/webm' });
 }
 
+/* ---- MP4 (H.264) muxer -------------------------------------------------
+   WebM/VP9 is fine for the web but many editors will not touch it, so MP4 is
+   the default. Layout is ftyp / mdat / moov with chunk offsets pointing into
+   the mdat already written. Not "faststart", which only matters for
+   progressive download over a network. */
+function mp4Box(type, ...parts){
+  let n = 8; for (const p of parts) n += p.length;
+  const out = new Uint8Array(n), dv = new DataView(out.buffer);
+  dv.setUint32(0, n);
+  for (let i = 0; i < 4; i++) out[4+i] = type.charCodeAt(i);
+  let o = 8; for (const p of parts){ out.set(p, o); o += p.length; }
+  return out;
+}
+const u8 = a => new Uint8Array(a);
+function u16(n){ const b = new Uint8Array(2); new DataView(b.buffer).setUint16(0, n); return b; }
+function u32(n){ const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, n >>> 0); return b; }
+const mp4Str = t => new TextEncoder().encode(t);
+
+function mp4Mux(frames, width, height, fps, description){
+  const timescale = 90000;                        // 90 kHz, the usual video clock
+  const dur = Math.round(timescale / fps);
+  const n = frames.length;
+  const total = frames.reduce((a, f) => a + f.data.length, 0);
+
+  const ftyp = mp4Box('ftyp', mp4Str('isom'), u32(0x200),
+                              mp4Str('isom'), mp4Str('iso2'), mp4Str('avc1'), mp4Str('mp41'));
+  const mdatStart = ftyp.length + 8;
+  const payload = new Uint8Array(total);
+  const sizes = [], offsets = [];
+  let o = 0;
+  for (const f of frames){
+    offsets.push(mdatStart + o); sizes.push(f.data.length);
+    payload.set(f.data, o); o += f.data.length;
+  }
+  const mdat = mp4Box('mdat', payload);
+
+  const avcC = mp4Box('avcC', new Uint8Array(description));
+  const avc1 = mp4Box('avc1',
+    u8([0,0,0,0,0,0]), u16(1),
+    u16(0), u16(0), u32(0), u32(0), u32(0),
+    u16(width), u16(height),
+    u32(0x00480000), u32(0x00480000),
+    u32(0), u16(1),
+    u8(new Array(32).fill(0)),
+    u16(0x0018), u16(0xffff),
+    avcC);
+  const stsd = mp4Box('stsd', u32(0), u32(1), avc1);
+  const stts = mp4Box('stts', u32(0), u32(1), u32(n), u32(dur));
+  const syncs = [];
+  frames.forEach((f, i) => { if (f.key) syncs.push(i + 1); });
+  const stss = mp4Box('stss', u32(0), u32(syncs.length), ...syncs.map(u32));
+  const stsc = mp4Box('stsc', u32(0), u32(1), u32(1), u32(1), u32(1));
+  const stsz = mp4Box('stsz', u32(0), u32(0), u32(n), ...sizes.map(u32));
+  const stco = mp4Box('stco', u32(0), u32(n), ...offsets.map(u32));
+  const stbl = mp4Box('stbl', stsd, stts, stss, stsc, stsz, stco);
+  const dref = mp4Box('dref', u32(0), u32(1), mp4Box('url ', u32(1)));
+  const minf = mp4Box('minf', mp4Box('vmhd', u32(1), u32(0), u32(0)),
+                              mp4Box('dinf', dref), stbl);
+  const mdhd = mp4Box('mdhd', u32(0), u32(0), u32(0), u32(timescale), u32(n * dur),
+                              u16(0x55c4), u16(0));
+  const hdlr = mp4Box('hdlr', u32(0), u32(0), mp4Str('vide'),
+                              u32(0), u32(0), u32(0), mp4Str('VideoHandler'), u8([0]));
+  const mdia = mp4Box('mdia', mdhd, hdlr, minf);
+  const ident = [u32(0x00010000), u32(0), u32(0),
+                 u32(0), u32(0x00010000), u32(0),
+                 u32(0), u32(0), u32(0x40000000)];
+  const durMovie = Math.round(n * dur * 1000 / timescale);
+  const tkhd = mp4Box('tkhd', u32(7), u32(0), u32(0), u32(1), u32(0), u32(durMovie),
+                              u32(0), u32(0), u16(0), u16(0), u16(0), u16(0),
+                              ...ident, u32(width << 16), u32(height << 16));
+  const trak = mp4Box('trak', tkhd, mdia);
+  const mvhd = mp4Box('mvhd', u32(0), u32(0), u32(0), u32(1000), u32(durMovie),
+                              u32(0x00010000), u16(0x0100), u16(0), u32(0), u32(0),
+                              ...ident, u32(0), u32(0), u32(0), u32(0), u32(0), u32(0), u32(2));
+  const moov = mp4Box('moov', mvhd, trak);
+  return new Blob([ftyp, mdat, moov], { type:'video/mp4' });
+}
+
+const VIDEO_FORMATS = {
+  mp4:   { label:'MP4 / H.264 (widest editor support)', ext:'mp4',
+           codec:['avc1.640028','avc1.4d0028','avc1.42001f'],
+           opts:{ avc:{ format:'avc' } } },
+  webm:  { label:'WebM / VP9 (smaller files)', ext:'webm',
+           codec:['vp09.00.10.08'], matroska:'V_VP9' },
+  webm8: { label:'WebM / VP8 (most compatible WebM)', ext:'webm',
+           codec:['vp8'], matroska:'V_VP8' },
+};
+
 /* ---- fixed-timestep advance ---------------------------------------------
    FIXED_DT overrides the adaptive chooser. Each video frame covers exactly
    msPerFrame of flight, split into equal sub-steps small enough for stability.
@@ -3023,11 +3117,49 @@ async function advanceExactly(ms){
 }
 
 /* ---- the exporter ---- */
-const EXP = { running:false, cancel:false, scale:null, readBuf:null, tex:null, buf:null, tw:0, th:0 };
+const EXP = { running:false, cancel:false, scale:null, slots:null, sw:0, sh:0, readBuf:null, tex:null, buf:null, tw:0, th:0 };
 
 /* A WebGPU canvas does not present until a task boundary, so drawImage() straight after
    submit() yields a blank frame. Render into our own texture and copy it out instead:
    deterministic, and it works at any resolution without touching the visible canvas. */
+/* One field per frame used to mean one GPU round trip per field, and those serialise:
+   seven fields cost seven full stalls rather than seven cheap renders. Issue all the
+   renders and copies first, then wait on the maps together. */
+function exportRenderSlot(k, w, h){
+  const dev = WG.dev;
+  if (!EXP.slots || EXP.sw !== w || EXP.sh !== h){
+    for (const sl of (EXP.slots || [])){ sl.tex.destroy(); sl.buf.destroy(); }
+    EXP.slots = []; EXP.sw = w; EXP.sh = h;
+    EXP.sbpr = Math.ceil(w * 4 / 256) * 256;
+  }
+  while (EXP.slots.length <= k){
+    EXP.slots.push({
+      tex: dev.createTexture({ size:[w, h], format:WG.fmt,
+        usage:GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC }),
+      buf: dev.createBuffer({ size:EXP.sbpr * h,
+        usage:GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ }),
+    });
+  }
+  const sl = EXP.slots[k];
+  const view = sl.tex.createView();
+  if (usingComp()) compRender(view, w, h); else wgpuRender(view, w, h);
+  const enc = dev.createCommandEncoder();
+  enc.copyTextureToBuffer({ texture:sl.tex },
+    { buffer:sl.buf, bytesPerRow:EXP.sbpr, rowsPerImage:h }, [w, h, 1]);
+  dev.queue.submit([enc.finish()]);
+  return sl.buf.mapAsync(GPUMapMode.READ);
+}
+function exportReadSlot(k, w, h){
+  const sl = EXP.slots[k];
+  const src = new Uint8Array(sl.buf.getMappedRange());
+  const row = w * 4;
+  const out = new Uint8ClampedArray(row * h);
+  if (EXP.sbpr === row) out.set(src.subarray(0, row * h));
+  else for (let y = 0; y < h; y++) out.set(src.subarray(y*EXP.sbpr, y*EXP.sbpr + row), y*row);
+  sl.buf.unmap();
+  return out;
+}
+
 async function exportGrab(w, h){
   const dev = WG.dev;
   if (!WG.ok){
@@ -3058,7 +3190,7 @@ async function exportGrab(w, h){
   await EXP.buf.mapAsync(GPUMapMode.READ);
   const src = new Uint8Array(EXP.buf.getMappedRange());
   const out = new Uint8ClampedArray(w * h * 4);
-  const swap = WG.fmt === 'bgra8unorm';
+  const swap = WG.fmt === 'bgra8unorm' && !EXPORTING;
   for (let y = 0; y < h; y++){
     const so = y * EXP.bpr, dof = y * w * 4;
     for (let x = 0; x < w; x++){
@@ -3077,20 +3209,63 @@ function expLog(msg){
   if (el) el.innerHTML = msg;
 }
 
-async function exportVideo(){
+const FIELD_NAMES = ['tracer','speed','vorticity','pressure','velocity','mach','schlieren'];
+const fieldsForModel = () => usingComp() ? [0,1,2,3,4,5,6] : [0,1,2,3,4];
+
+function setProgress(frac, label){
+  const f = document.getElementById('pbarFill');
+  if (f) f.style.width = (Math.max(0, Math.min(1, frac)) * 100).toFixed(1) + '%';
+  if (label !== undefined) expLog(label);
+}
+
+async function makeEncoder(fmtKey, width, height, fps, bitrate, sink){
+  const f = VIDEO_FORMATS[fmtKey];
+  let chosen = null;
+  for (const c of f.codec){
+    try {
+      const r = await VideoEncoder.isConfigSupported({ codec:c, width, height, bitrate,
+                                                       framerate:fps });
+      if (r.supported){ chosen = c; break; }
+    } catch (e){}
+  }
+  if (!chosen) throw new Error('no supported codec for ' + f.label);
+  const enc = new VideoEncoder({
+    output: (chunk, meta) => {
+      if (meta && meta.decoderConfig && meta.decoderConfig.description && !sink.desc)
+        sink.desc = new Uint8Array(meta.decoderConfig.description);
+      const b = new Uint8Array(chunk.byteLength); chunk.copyTo(b);
+      sink.frames.push({ data:b, timestamp:chunk.timestamp, key:chunk.type === 'key' });
+    },
+    error: (e) => { sink.err = e; },
+  });
+  enc.configure(Object.assign({ codec:chosen, width, height, bitrate,
+                                framerate:fps, latencyMode:'quality' }, f.opts || {}));
+  return enc;
+}
+
+function saveBlob(blob, name){
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = name;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+
+/* One scan pass fixes the colour range; one stepping pass then feeds every requested
+   field's encoder from the same simulation. Rendering costs a fraction of a step, so
+   seven videos cost barely more than one. */
+async function runExport(fields){
   if (EXP.running) { EXP.cancel = true; return; }
   if (typeof VideoEncoder === 'undefined'){
     expLog('<span style="color:var(--bad)">This browser has no WebCodecs VideoEncoder.</span>');
     return;
   }
+  const fmtKey = OPT.format, fmt = VIDEO_FORMATS[fmtKey];
   const flightMs   = P.vidFlight;
   const fps        = Math.round(P.vidFps);
   const msPerFrame = P.vidMsPerFrame;
   const total      = Math.max(1, Math.round(flightMs / msPerFrame));
-  const width      = Math.round(P.vidWidth / 2) * 2;
-
-  // Labels live in bands above and below the image, never on top of it, so no backing
-  // panel is needed and nothing can obscure the flow.
+  const width      = Math.round(P.vidWidth / 64) * 64;   // 256-byte aligned rows
   const sc      = Math.max(1, width / 900);
   const headerH = Math.round(40 * sc);
   const footerH = Math.round(52 * sc);
@@ -3098,109 +3273,131 @@ async function exportVideo(){
   const height  = Math.round((simH + headerH + footerH) / 2) * 2;
 
   EXP.running = true; EXP.cancel = false; EXP.scale = null;
-  const btn = document.getElementById('expBtn');
-  btn.textContent = 'Cancel export';
-  const wasRunning = S.running;
+  const btns = [document.getElementById('expBtn'), document.getElementById('expAllBtn')];
+  btns[0].textContent = 'Cancel export';
+  btns[1].disabled = true;
+  const wasRunning = S.running, wasField = VIEW.field;
   S.running = false;
   EXPORTING = true;
 
   const comp = document.createElement('canvas');
   comp.width = width; comp.height = height;
   const cx = comp.getContext('2d');
+  const sinks = fields.map(() => ({ frames:[], desc:null, err:null }));
+  const encoders = [];
+  let fatal = null;
 
-  const frames = [];
-  let encoder = null, encErr = null;
-  const codec = 'vp09.00.10.08', codecId = 'V_VP9';
   try {
-    // ---- pass 1: find the peak, so the colour scale can be fixed for the whole clip ----
-    if (P.vidPrepass){
+    // ---- pass 1: peak, so the colour range is fixed for the whole clip ----
+    const key = encodeState() + '|' + flightMs + '|' + msPerFrame + '|' + S.activeModel;
+    let peak;
+    if (EXP.peakKey === key){
+      peak = EXP.peakVal;
+      setProgress(0, 'colour range reused from the last run of this configuration');
+      await new Promise(r => setTimeout(r, 0));
+    } else {
       buildGrid();
-      let peak = 0;
+      peak = 0;
       for (let i = 0; i < total; i++){
-        if (EXP.cancel) break;
+        if (EXP.cancel) throw new Error('cancelled');
         await advanceExactly(msPerFrame);
         peak = Math.max(peak, S.vmax);
         if (i % 8 === 0){
-          expLog(`scanning for the colour range — ${((i+1)/total*100).toFixed(0)}%`);
+          setProgress((i + 1) / total * 0.35,
+            `pass 1 of 2 — scanning for the colour range, ${((i+1)/total*100).toFixed(0)}%`);
           await new Promise(r => setTimeout(r, 0));
         }
       }
-      EXP.scale = colourScaleFor(Math.max(peak, 1e-6));
-    } else {
-      EXP.scale = colourScaleFor(S.vmax);
+      EXP.peakKey = key; EXP.peakVal = peak;
     }
-    if (EXP.cancel) throw new Error('cancelled');
+    const scales = {};
+    for (const f of fields){ VIEW.field = f; scales[f] = colourScaleFor(Math.max(peak, 1e-6)); }
 
-    encoder = new VideoEncoder({
-      output: (chunk) => {
-        const buf = new Uint8Array(chunk.byteLength);
-        chunk.copyTo(buf);
-        frames.push({ data:buf, timestamp:chunk.timestamp, key:chunk.type === 'key' });
-      },
-      error: (e) => { encErr = e; },
-    });
-    encoder.configure({ codec, width, height,
-      bitrate: Math.round(P.vidMbps * 1e6), framerate: fps, latencyMode:'quality' });
+    for (let k = 0; k < fields.length; k++)
+      encoders.push(await makeEncoder(fmtKey, width, height, fps,
+                                      Math.round(P.vidMbps * 1e6), sinks[k]));
 
-    // ---- pass 2: the recording proper, from the same initial state ----
+    // ---- pass 2: step once, render and encode every field ----
     buildGrid();
     await new Promise(r => setTimeout(r, 0));
-
     const t0 = performance.now();
     for (let i = 0; i < total; i++){
-      if (EXP.cancel || encErr) break;
+      if (EXP.cancel) throw new Error('cancelled');
+      for (const sk of sinks) if (sk.err) throw sk.err;
       const nSub = await advanceExactly(msPerFrame);
-      const px = await exportGrab(width, simH);
-
-      cx.fillStyle = '#0b0e13';
-      cx.fillRect(0, 0, width, height);
-      cx.putImageData(new ImageData(px, width, simH), 0, headerH);
-      drawOverlay(cx, width, height, headerH, simH, footerH, sc);
-
-      const vf = new VideoFrame(comp, {
-        timestamp: Math.round(i * 1e6 / fps),
-        duration: Math.round(1e6 / fps),
-      });
-      encoder.encode(vf, { keyFrame: i % Math.max(1, fps * 2) === 0 });
-      vf.close();
-      while (encoder.encodeQueueSize > 6) await new Promise(r => setTimeout(r, 1));
-
-      if (i % 5 === 0 || i === total - 1){
+      const maps = [];
+      for (let k = 0; k < fields.length; k++){
+        VIEW.field = fields[k];
+        EXP.scale = scales[fields[k]];
+        maps.push(exportRenderSlot(k, width, simH));
+      }
+      await Promise.all(maps);
+      for (let k = 0; k < fields.length; k++){
+        VIEW.field = fields[k];
+        EXP.scale = scales[fields[k]];
+        S.colourScale = scales[fields[k]];
+        const px = exportReadSlot(k, width, simH);
+        cx.fillStyle = '#0b0e13';
+        cx.fillRect(0, 0, width, height);
+        cx.putImageData(new ImageData(px, width, simH), 0, headerH);
+        drawOverlay(cx, width, height, headerH, simH, footerH, sc);
+        const vf = new VideoFrame(comp, { timestamp: Math.round(i * 1e6 / fps),
+                                          duration: Math.round(1e6 / fps) });
+        encoders[k].encode(vf, { keyFrame: i % Math.max(1, fps * 2) === 0 });
+        vf.close();
+      }
+      for (const e of encoders)
+        while (e.encodeQueueSize > 8) await new Promise(r => setTimeout(r, 0));
+      if (i % 4 === 0 || i === total - 1){
         const el = performance.now() - t0;
         const eta = (el / (i + 1)) * (total - i - 1) / 1000;
-        expLog(`encoding ${i+1}/${total} (${((i+1)/total*100).toFixed(0)}%) · ` +
-               `${nSub} sub-steps · t = ${S.t.toFixed(2)} ms · ${eta.toFixed(0)} s left`);
+        setProgress(0.35 + (i + 1) / total * 0.65,
+          `pass 2 of 2 — encoding ${i+1}/${total} · ${fields.length} field` +
+          `${fields.length > 1 ? 's' : ''} · ${nSub} sub-steps · t = ${S.t.toFixed(2)} ms · ` +
+          `${eta.toFixed(0)} s left`);
         await new Promise(r => setTimeout(r, 0));
       }
     }
-    await encoder.flush();
+    for (const e of encoders) await e.flush();
   } catch (e){
-    if (!/cancelled/.test(e.message || '')) encErr = e;
+    if (!/cancelled/.test(e.message || '')) fatal = e;
   } finally {
-    if (encoder && encoder.state !== 'closed') { try { encoder.close(); } catch(e){} }
-    EXPORTING = false; EXP.scale = null;
-    EXP.running = false;
-    btn.textContent = 'Export video';
+    for (const e of encoders) if (e.state !== 'closed') { try { e.close(); } catch(x){} }
+    EXPORTING = false; EXP.scale = null; EXP.running = false;
+    VIEW.field = wasField;
+    btns[0].textContent = 'Export video';
+    btns[1].disabled = false;
     S.running = wasRunning;
     resizeCanvas();
   }
 
-  if (encErr){
-    expLog(`<span style="color:var(--bad)">Encoder error: ${encErr.message || encErr}</span>`);
+  if (fatal){
+    setProgress(0, `<span style="color:var(--bad)">Encoder error: ${fatal.message || fatal}</span>`);
     return;
   }
-  if (!frames.length){ expLog('Cancelled — nothing written.'); return; }
+  if (!sinks[0].frames.length){ setProgress(0, 'Cancelled — nothing written.'); return; }
 
-  const blob = webmMux(frames, width, height, fps, codecId);
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `airzooka_${Math.round(P.exitR*10)/10}mm_${flightMs}ms.webm`;
-  document.body.appendChild(a); a.click(); document.body.removeChild(a);
-  setTimeout(() => URL.revokeObjectURL(url), 30000);
-  expLog(`Done — ${frames.length} frames, ${(blob.size/1e6).toFixed(1)} MB, ` +
-         `${(frames.length/fps).toFixed(1)} s of video.`);
+  const base = `airzooka_${Math.round(P.exitR*10)/10}mm_${flightMs}ms`;
+  let bytes = 0;
+  for (let k = 0; k < fields.length; k++){
+    const sk = sinks[k];
+    const blob = fmt.matroska
+      ? webmMux(sk.frames, width, height, fps, fmt.matroska)
+      : mp4Mux(sk.frames, width, height, fps, sk.desc || new Uint8Array(0));
+    bytes += blob.size;
+    const name = fields.length > 1
+      ? `${base}_${FIELD_NAMES[fields[k]]}.${fmt.ext}`
+      : `${base}_${FIELD_NAMES[fields[k]]}.${fmt.ext}`;
+    saveBlob(blob, name);
+    if (k < fields.length - 1) await new Promise(r => setTimeout(r, 350));  // browsers throttle bursts
+  }
+  setProgress(1, `Done — ${fields.length} file${fields.length > 1 ? 's' : ''}, ` +
+    `${sinks[0].frames.length} frames each, ${(bytes/1e6).toFixed(1)} MB total, ` +
+    `${(sinks[0].frames.length/fps).toFixed(1)} s of video.`);
 }
+
+const exportVideo = () => runExport([VIEW.field]);
+const exportAllFields = () => runExport(fieldsForModel());
 
 /* Labels go in the bands above and below the image, so nothing is drawn over the flow and
    no semi-transparent backing panel is needed. */
@@ -3297,11 +3494,26 @@ for (const g of CONTROLS){
   if (vid){
     const body = vid.querySelector('.body');
     const box = document.createElement('div');
-    box.innerHTML = `<div class="btnrow"><button id="expBtn">Export video</button></div>
+    box.innerHTML = `<div class="ctl"><div class="lab"><span>File format</span></div>
+        <select id="fmtSel"></select></div>
+      <div class="btnrow">
+        <button id="expBtn">Export video</button>
+        <button id="expAllBtn">Export all fields</button>
+      </div>
+      <div class="pbar"><div id="pbarFill"></div></div>
       <div class="hint" id="expDerived"></div>
       <div class="hint" id="expStatus" style="margin-top:4px"></div>`;
     body.appendChild(box);
+    const fs = box.querySelector('#fmtSel');
+    for (const k in VIDEO_FORMATS){
+      const o = document.createElement('option');
+      o.value = k; o.textContent = VIDEO_FORMATS[k].label; fs.appendChild(o);
+    }
+    fs.value = OPT.format;
+    fs.addEventListener('change', e => { OPT.format = e.target.value; scheduleURLSync(true); });
+    UI.fmtSel = fs;
     box.querySelector('#expBtn').addEventListener('click', exportVideo);
+    box.querySelector('#expAllBtn').addEventListener('click', exportAllFields);
     for (const k of ['vidFlight','vidMsPerFrame','vidFps'])
       sliders[k].inp.addEventListener('input', updateExportDerived);
   }
@@ -3312,8 +3524,10 @@ function updateExportDerived(){
   const total = Math.max(1, Math.round(P.vidFlight / P.vidMsPerFrame));
   const vidSec = total / P.vidFps;
   const slow = 1000 / (P.vidMsPerFrame * P.vidFps);
+  const nf = fieldsForModel().length;
   el.innerHTML = `<b>${total}</b> frames → <b>${vidSec.toFixed(1)} s</b> of video, ` +
-    `playing at <b>${slow >= 1 ? slow.toFixed(0)+'× slow motion' : (1/slow).toFixed(1)+'× fast'}</b>.`;
+    `playing at <b>${slow >= 1 ? slow.toFixed(0)+'× slow motion' : (1/slow).toFixed(1)+'× fast'}</b>. ` +
+    `“All fields” writes <b>${nf}</b> files from one simulation.`;
 }
 
 /* ---- physical model selector ---- */
@@ -3332,6 +3546,17 @@ function updateExportDerived(){
     OPT.model = e.target.value; buildGrid(); scheduleURLSync(true); updateMetrics();
   });
 }
+/* The three quality buttons behave as a radio group, so one of them should look chosen. */
+function markActiveQuality(){
+  for (const b of document.querySelectorAll('#qrow button')){
+    const q = QUALITY.find(x => x.n === b.dataset.quality);
+    const on = q && Math.abs(P.res - q.q.res) < 1e-9
+                 && Math.abs(P.iters - q.q.iters) < 1e-9
+                 && Math.abs(P.cfl - q.q.cfl) < 1e-9;
+    b.classList.toggle('active', !!on);
+  }
+}
+
 function modelBlurb(){
   const el = document.getElementById('modelWhy');
   if (!el) return;
@@ -3414,8 +3639,10 @@ const QUALITY = [
   for (const q of QUALITY){
     const b = document.createElement('button');
     b.innerHTML = `<b>${q.n}</b><i>${q.d}</i>`;
+    b.dataset.quality = q.n;
     b.addEventListener('click', () => {
-      Object.assign(P, q.q); syncSliders(); buildGrid(); scheduleURLSync(true); updateMetrics();
+      Object.assign(P, q.q); syncSliders(); buildGrid(); scheduleURLSync(true);
+      markActiveQuality(); updateMetrics();
     });
     row.appendChild(b);
   }
@@ -3482,6 +3709,7 @@ const URLKEY = {
   visc:'nu', smag:'cs', vortEps:'vc', dyeDiss:'dd',
   downrange:'dn', zAspect:'za', res:'rs', iters:'it', cfl:'cf', budget:'bg', spf:'sp',
   probe:'pb',
+  vidFlight:'vf', vidMsPerFrame:'vm', vidFps:'vr', vidWidth:'vw', vidMbps:'vb',
 };
 const URLKEY_INV = Object.fromEntries(Object.entries(URLKEY).map(([a,b]) => [b,a]));
 const MODEL_CODE = { auto:0, incompressible:1, compressible:2 };
@@ -3503,6 +3731,7 @@ function encodeState(){
   if (VIEW.field !== 0)      out.push('fd=' + VIEW.field);
   if (Math.abs(VIEW.gain - 1) > 1e-6) out.push('gn=' + trimNum(VIEW.gain));
   if (!VIEW.showGeom)        out.push('gm=0');
+  if (OPT.format !== 'mp4')  out.push('vc=' + OPT.format);
   return out.join('&');
 }
 
@@ -3529,6 +3758,7 @@ function applyStateFromURL(){
       VIEW.gain = Math.min(32, Math.max(0.06, num)); any = true;
     }
     else if (key === 'gm'){ VIEW.showGeom = num !== 0; any = true; }
+    else if (key === 'vc' && VIDEO_FORMATS[val]){ OPT.format = val; any = true; }
   }
   return any;
 }
@@ -3542,6 +3772,7 @@ function pushStateToDOM(){
     UI.gainOut.textContent = VIEW.gain.toFixed(VIEW.gain < 1 ? 2 : 1) + '×';
   }
   const ms = document.getElementById('modelSel'); if (ms) ms.value = OPT.model;
+  if (UI.fmtSel) UI.fmtSel.value = OPT.format;
   const ac = document.getElementById('autoPace'); if (ac) ac.checked = OPT.autoPace;
 }
 

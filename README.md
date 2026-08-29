@@ -230,6 +230,17 @@ frame advances exactly the same simulated interval**, subdivided into as many eq
 as stability requires. The sub-step count varies between frames; the frame interval never
 does. Verified: 30 exported frames, all frame intervals exactly 0.2000000 ms.
 
+Formats: **MP4/H.264** by default (widest editor support), or WebM/VP9 and WebM/VP8.
+WebCodecs supplies encoded chunks but no container, so both muxers are written here — a
+minimal Matroska writer and a minimal MP4 writer (ftyp / mdat / moov).
+
+**Export all fields** writes one file per field — `_tracer`, `_speed`, `_vorticity`,
+`_pressure`, `_velocity`, and on the compressible solver `_mach` and `_schlieren` too — from a
+**single simulation**. Stepping is the expensive part and rendering is nearly free, so the
+extra fields cost far less than re-running: measured over 80 frames, five fields took 7.6× a
+single field rather than the 5× a naive re-run would cost plus a second scan pass each. The
+peak found by the scan is also cached per configuration, so a repeat export skips it.
+
 **The colour scale is fixed for the whole clip.** On screen the range tracks the flow, which
 is what you want while exploring; in a video it means a colour does not signify the same thing
 from one frame to the next, and the numbers under the legend visibly crawl. Export therefore
