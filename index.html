@@ -651,6 +651,10 @@ const CONTROLS = [
    { k:'vidFps',        t:'Video frame rate',   min:12, max:60, step:1, v:30, unit:'fps' },
    { k:'vidWidth',      t:'Video width',        min:480, max:1920, step:80, v:1280, unit:'px' },
    { k:'vidMbps',       t:'Bitrate',            min:1, max:40, step:1, v:12, unit:'Mb/s' },
+   { k:'vidPrepass',    t:'Fixed colour scale',  min:0, max:1, step:1, v:1,
+     hint:'Runs the shot once first to find the peak, so the colour range is identical in ' +
+          'every frame. Costs roughly double. With it off the range is frozen at whatever ' +
+          'the current frame shows — still constant, but probably a poor choice.' },
  ]},
  { group:'Measurement', items:[
    { k:'probe',      t:'Target distance from muzzle', min:10, max:1000, step:5, v:150, unit:'mm' },
@@ -983,22 +987,13 @@ window.addEventListener('resize', () => { if (S.Nz) resizeCanvas(); });
 function render(){
   if (usingComp()){ compRender(); return; }
   if (WG.ok){ wgpuRender(); return; }
-  const g = VIEW.gain;
-  let base;
-  switch (VIEW.field){
-    case 1: base = Math.max(S.vmax * 0.75, 1e-3); break;
-    case 2: base = Math.max(S.vmax / Math.min(S.dz, S.dr) * 0.12, 1e-3); break;
-    case 3: base = Math.max(S.vmax * S.vmax * 0.4, 1e-3); break;
-    case 4: base = Math.max(S.vmax * 0.75, 1e-3); break;
-    default: base = 1;
-  }
-  S.colourScale = base / g;
+  S.colourScale = activeColourScale();
   run(PROG.show, null,
       { uVel:S.vel.read.tex, uDye:S.dye.read.tex, uVort:S.vort.read.tex, uPres:S.pres.read.tex },
       p => {
         gl.uniform2f(loc(p,'uViewport'), canvas.width, canvas.height);
         gl.uniform1i(loc(p,'uField'), VIEW.field);
-        gl.uniform1f(loc(p,'uScale'), base / g);
+        gl.uniform1f(loc(p,'uScale'), S.colourScale);
         gl.uniform1i(loc(p,'uShowGeom'), VIEW.showGeom ? 1 : 0);
         gl.uniform1f(loc(p,'uProbeZ'), Math.min(S.Lz - S.dz, S.Z1 + P.plateT + P.probe));
       });
@@ -1099,6 +1094,29 @@ function updateMetrics(){
   modelBlurb();
 }
 
+/* The colour scale was computed independently in three render paths, each from the live
+   S.vmax. That is fine on screen but wrong in a video: the numbers under the ramp would
+   change every frame, so a colour would not mean the same thing twice. One definition,
+   and an export override that freezes it. */
+function colourScaleFor(vmax){
+  const g = VIEW.gain, comp = usingComp();
+  let base;
+  switch (VIEW.field){
+    case 1: base = Math.max(vmax * 0.75, 1e-3); break;
+    case 2: base = Math.max(vmax / Math.min(S.dz, S.dr) * 0.12, 1e-3); break;
+    case 3: base = comp ? Math.max(AIR.rho0 * vmax * vmax, 50)
+                        : Math.max(vmax * vmax * 0.4, 1e-3); break;
+    case 4: base = Math.max(vmax * 0.75, 1e-3); break;
+    case 5: base = 1.4; break;
+    case 6: base = Math.max(AIR.rho0 * 0.35 / Math.min(S.dz, S.dr), 1e-3); break;
+    default: base = 1;
+  }
+  return base / g;
+}
+function activeColourScale(){
+  return (EXPORTING && EXP.scale) ? EXP.scale : colourScaleFor(S.vmax);
+}
+
 /* ========================== colour legend ==========================
    The colour maps are duplicated from the shaders rather than shared, because one lives in
    WGSL and the other in GLSL. They must stay in step; the fits below are the same
@@ -1150,6 +1168,36 @@ function fmtTick(v){
   if (a >= 0.01) return v.toFixed(2);
   return v.toExponential(1);
 }
+
+/* Paints the ramp, its name, units and end/mid ticks into any 2D context, so the on-screen
+   legend and the one burned into exported video come from the same code. */
+function paintLegend(ctx, x, y, w, h, scale, fontPx){
+  const sp = legendSpec(scale);
+  const f = fontPx || 10;
+  const bh = Math.max(6, Math.round(h * 0.24));
+  const by = y + f + 4;
+  for (let i = 0; i < w; i++){
+    const t = i / (w - 1);
+    let c;
+    if (sp.map === 'viridis') c = viridisJS(t);
+    else if (sp.map === 'div') c = divergingJS(t * 2 - 1);
+    else c = [t, t, t];
+    ctx.fillStyle = rgb(c);
+    ctx.fillRect(x + i, by, 1, bh);
+  }
+  ctx.strokeStyle = 'rgba(255,255,255,0.25)'; ctx.lineWidth = 1;
+  ctx.strokeRect(x + 0.5, by + 0.5, w - 1, bh - 1);
+  ctx.font = f + 'px ui-monospace, SFMono-Regular, Menlo, monospace';
+  ctx.textBaseline = 'alphabetic';
+  ctx.textAlign = 'left';  ctx.fillStyle = '#c8d4e0'; ctx.fillText(sp.name, x, by - 4);
+  ctx.textAlign = 'right'; ctx.fillStyle = '#8b97a6'; ctx.fillText(sp.unit, x + w, by - 4);
+  ctx.fillStyle = '#c8d4e0';
+  ctx.textAlign = 'left';   ctx.fillText(fmtTick(sp.lo), x, by + bh + f + 1);
+  ctx.textAlign = 'center'; ctx.fillText(fmtTick((sp.lo + sp.hi) / 2), x + w/2, by + bh + f + 1);
+  ctx.textAlign = 'right';  ctx.fillText(fmtTick(sp.hi), x + w, by + bh + f + 1);
+  ctx.textAlign = 'left';
+}
+
 function drawLegend(scale){
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
   const w = 220, h = 38;
@@ -1158,36 +1206,7 @@ function drawLegend(scale){
   }
   lctx.setTransform(dpr,0,0,dpr,0,0);
   lctx.clearRect(0,0,w,h);
-  const sp = legendSpec(scale);
-  const bx = 4, by = 15, bw = w - 8, bh = 9;
-
-  for (let i = 0; i < bw; i++){
-    const t = i / (bw - 1);
-    let c;
-    if (sp.map === 'viridis') c = viridisJS(t);
-    else if (sp.map === 'div') c = divergingJS(t * 2 - 1);
-    else c = [t, t, t];
-    lctx.fillStyle = rgb(c);
-    lctx.fillRect(bx + i, by, 1, bh);
-  }
-  lctx.strokeStyle = 'rgba(255,255,255,0.25)'; lctx.lineWidth = 1;
-  lctx.strokeRect(bx + 0.5, by + 0.5, bw - 1, bh - 1);
-
-  lctx.fillStyle = '#c8d4e0';
-  lctx.font = '10px ui-monospace, SFMono-Regular, Menlo, monospace';
-  lctx.textBaseline = 'alphabetic';
-  lctx.fillText(sp.name, bx, by - 4);
-  lctx.textAlign = 'right';
-  lctx.fillStyle = '#8b97a6';
-  lctx.fillText(sp.unit, bx + bw, by - 4);
-  lctx.textAlign = 'left';
-  lctx.fillStyle = '#c8d4e0';
-  lctx.fillText(fmtTick(sp.lo), bx, by + bh + 10);
-  lctx.textAlign = 'center';
-  lctx.fillText(fmtTick((sp.lo + sp.hi) / 2), bx + bw/2, by + bh + 10);
-  lctx.textAlign = 'right';
-  lctx.fillText(fmtTick(sp.hi), bx + bw, by + bh + 10);
-  lctx.textAlign = 'left';
+  paintLegend(lctx, 4, 1, w - 8, h - 2, scale, 10);
 }
 
 /* ========================== time-series plot ========================== */
@@ -2038,18 +2057,9 @@ function wgpuRender(targetView, outW, outH){
   const dev = WG.dev;
   const cv = WG.canvas;
   const w = cv.width, h = cv.height;
-  const g = VIEW.gain;
-  let base;
-  switch (VIEW.field){
-    case 1: base = Math.max(S.vmax * 0.75, 1e-3); break;
-    case 2: base = Math.max(S.vmax / Math.min(S.dz, S.dr) * 0.12, 1e-3); break;
-    case 3: base = Math.max(S.vmax * S.vmax * 0.4, 1e-3); break;
-    case 4: base = Math.max(S.vmax * 0.75, 1e-3); break;
-    default: base = 1;
-  }
-  S.colourScale = base / g;
+  S.colourScale = activeColourScale();
   const su = new Float32Array(8);
-  su[0] = outW || w; su[1] = outH || h; su[2] = VIEW.field; su[3] = base / g;
+  su[0] = outW || w; su[1] = outH || h; su[2] = VIEW.field; su[3] = S.colourScale;
   su[4] = VIEW.showGeom ? 1 : 0;
   su[5] = Math.min(S.Lz - S.dz, S.Z1 + P.plateT + P.probe);
   dev.queue.writeBuffer(WG.buf.showU, 0, su);
@@ -2839,20 +2849,9 @@ function compSteps(n){
 
 function compRender(targetView, outW, outH){
   const dev = WG.dev, cv = WG.canvas;
-  const g = VIEW.gain;
-  let base;
-  switch (VIEW.field){
-    case 1: base = Math.max(S.vmax * 0.75, 1e-3); break;
-    case 2: base = Math.max(S.vmax / Math.min(S.dz, S.dr) * 0.12, 1e-3); break;
-    case 3: base = Math.max(AIR.rho0 * S.vmax * S.vmax, 50); break;   // dynamic pressure scale
-    case 4: base = Math.max(S.vmax * 0.75, 1e-3); break;
-    case 5: base = 1.4; break;                                        // Mach
-    case 6: base = Math.max(AIR.rho0 * 0.35 / Math.min(S.dz, S.dr), 1e-3); break;
-    default: base = 1;
-  }
-  S.colourScale = base / g;
+  S.colourScale = activeColourScale();
   const su = new Float32Array(8);
-  su[0] = outW || cv.width; su[1] = outH || cv.height; su[2] = VIEW.field; su[3] = base / g;
+  su[0] = outW || cv.width; su[1] = outH || cv.height; su[2] = VIEW.field; su[3] = S.colourScale;
   su[4] = VIEW.showGeom ? 1 : 0;
   su[5] = Math.min(S.Lz - S.dz, S.Z1 + P.plateT + P.probe);
   dev.queue.writeBuffer(WG.buf.showU, 0, su);
@@ -3024,7 +3023,7 @@ async function advanceExactly(ms){
 }
 
 /* ---- the exporter ---- */
-const EXP = { running:false, cancel:false, readBuf:null, tex:null, buf:null, tw:0, th:0 };
+const EXP = { running:false, cancel:false, scale:null, readBuf:null, tex:null, buf:null, tw:0, th:0 };
 
 /* A WebGPU canvas does not present until a task boundary, so drawImage() straight after
    submit() yields a blank frame. Render into our own texture and copy it out instead:
@@ -3089,19 +3088,22 @@ async function exportVideo(){
   const msPerFrame = P.vidMsPerFrame;
   const total      = Math.max(1, Math.round(flightMs / msPerFrame));
   const width      = Math.round(P.vidWidth / 2) * 2;
-  const height     = Math.max(2, Math.round(width * (2*S.Rmax) / S.Lz / 2) * 2);
 
-  EXP.running = true; EXP.cancel = false;
+  // Labels live in bands above and below the image, never on top of it, so no backing
+  // panel is needed and nothing can obscure the flow.
+  const sc      = Math.max(1, width / 900);
+  const headerH = Math.round(40 * sc);
+  const footerH = Math.round(52 * sc);
+  const simH    = Math.max(2, Math.round(width * (2 * S.Rmax) / S.Lz));
+  const height  = Math.round((simH + headerH + footerH) / 2) * 2;
+
+  EXP.running = true; EXP.cancel = false; EXP.scale = null;
   const btn = document.getElementById('expBtn');
   btn.textContent = 'Cancel export';
   const wasRunning = S.running;
   S.running = false;
   EXPORTING = true;
 
-  // render target at export resolution, plus a 2D canvas to composite overlays onto
-  const live = WG.ok ? WG.canvas : canvas;
-  const savedW = live.width, savedH = live.height;
-  const savedStyleW = live.style.width, savedStyleH = live.style.height;
   const comp = document.createElement('canvas');
   comp.width = width; comp.height = height;
   const cx = comp.getContext('2d');
@@ -3110,6 +3112,25 @@ async function exportVideo(){
   let encoder = null, encErr = null;
   const codec = 'vp09.00.10.08', codecId = 'V_VP9';
   try {
+    // ---- pass 1: find the peak, so the colour scale can be fixed for the whole clip ----
+    if (P.vidPrepass){
+      buildGrid();
+      let peak = 0;
+      for (let i = 0; i < total; i++){
+        if (EXP.cancel) break;
+        await advanceExactly(msPerFrame);
+        peak = Math.max(peak, S.vmax);
+        if (i % 8 === 0){
+          expLog(`scanning for the colour range — ${((i+1)/total*100).toFixed(0)}%`);
+          await new Promise(r => setTimeout(r, 0));
+        }
+      }
+      EXP.scale = colourScaleFor(Math.max(peak, 1e-6));
+    } else {
+      EXP.scale = colourScaleFor(S.vmax);
+    }
+    if (EXP.cancel) throw new Error('cancelled');
+
     encoder = new VideoEncoder({
       output: (chunk) => {
         const buf = new Uint8Array(chunk.byteLength);
@@ -3119,19 +3140,22 @@ async function exportVideo(){
       error: (e) => { encErr = e; },
     });
     encoder.configure({ codec, width, height,
-      bitrate: Math.round(P.vidMbps * 1e6), framerate: fps,
-      latencyMode:'quality' });
+      bitrate: Math.round(P.vidMbps * 1e6), framerate: fps, latencyMode:'quality' });
 
-    buildGrid();                                  // deterministic start
+    // ---- pass 2: the recording proper, from the same initial state ----
+    buildGrid();
     await new Promise(r => setTimeout(r, 0));
 
     const t0 = performance.now();
     for (let i = 0; i < total; i++){
       if (EXP.cancel || encErr) break;
       const nSub = await advanceExactly(msPerFrame);
-      const px = await exportGrab(width, height);
-      cx.putImageData(new ImageData(px, width, height), 0, 0);
-      drawOverlay(cx, width, height);
+      const px = await exportGrab(width, simH);
+
+      cx.fillStyle = '#0b0e13';
+      cx.fillRect(0, 0, width, height);
+      cx.putImageData(new ImageData(px, width, simH), 0, headerH);
+      drawOverlay(cx, width, height, headerH, simH, footerH, sc);
 
       const vf = new VideoFrame(comp, {
         timestamp: Math.round(i * 1e6 / fps),
@@ -3142,22 +3166,19 @@ async function exportVideo(){
       while (encoder.encodeQueueSize > 6) await new Promise(r => setTimeout(r, 1));
 
       if (i % 5 === 0 || i === total - 1){
-        const pct = ((i + 1) / total * 100).toFixed(0);
         const el = performance.now() - t0;
         const eta = (el / (i + 1)) * (total - i - 1) / 1000;
-        expLog(`frame ${i+1}/${total} (${pct}%) · ${nSub} sub-steps · ` +
-               `t = ${S.t.toFixed(2)} ms · ${eta.toFixed(0)} s left`);
+        expLog(`encoding ${i+1}/${total} (${((i+1)/total*100).toFixed(0)}%) · ` +
+               `${nSub} sub-steps · t = ${S.t.toFixed(2)} ms · ${eta.toFixed(0)} s left`);
         await new Promise(r => setTimeout(r, 0));
       }
     }
     await encoder.flush();
   } catch (e){
-    encErr = e;
+    if (!/cancelled/.test(e.message || '')) encErr = e;
   } finally {
     if (encoder && encoder.state !== 'closed') { try { encoder.close(); } catch(e){} }
-    live.width = savedW; live.height = savedH;
-    live.style.width = savedStyleW; live.style.height = savedStyleH;
-    EXPORTING = false;
+    EXPORTING = false; EXP.scale = null;
     EXP.running = false;
     btn.textContent = 'Export video';
     S.running = wasRunning;
@@ -3181,40 +3202,47 @@ async function exportVideo(){
          `${(frames.length/fps).toFixed(1)} s of video.`);
 }
 
-/* Burned-in overlay: without it an exported clip has no scale and no clock. */
-function drawOverlay(cx, w, h){
-  const s = Math.max(1, w / 900);
-  cx.save();
-  cx.scale(s, s);
-  const W = w / s, H = h / s;
-  cx.font = '13px ui-monospace, SFMono-Regular, Menlo, monospace';
-  cx.textBaseline = 'top';
-  const lines = [
-    `t = ${S.t.toFixed(2)} ms`,
-    `${usingComp() ? 'compressible' : 'incompressible'} · bore ${fmt(P.boreR,1)} mm · ` +
-    `exit ${fmt(P.exitR,1)} mm · L/D ${fmt(derived().LD,2)}`,
-  ];
-  cx.fillStyle = 'rgba(0,0,0,0.45)';
-  cx.fillRect(6, 6, 330, 6 + lines.length * 17);
+/* Labels go in the bands above and below the image, so nothing is drawn over the flow and
+   no semi-transparent backing panel is needed. */
+function drawOverlay(cx, w, h, headerH, simH, footerH, sc){
+  const f = Math.round(13 * sc);
   cx.fillStyle = '#dfe6ee';
-  lines.forEach((t, i) => cx.fillText(t, 12, 11 + i * 17));
-  // colour legend, drawn from the same canvas the UI uses
-  drawLegend(S.colourScale || 1);
-  cx.drawImage(legendCv, 8, H - 46, 220, 38);
-  // physical scale bar: a round number of millimetres
-  const pxPerMm = W / S.Lz;
-  let barMm = Math.pow(10, Math.floor(Math.log10(S.Lz / 5)));
-  if (barMm * pxPerMm < W * 0.1) barMm *= 2;
-  cx.strokeStyle = '#dfe6ee'; cx.fillStyle = '#dfe6ee'; cx.lineWidth = 1.5;
-  const bx = W - 20 - barMm * pxPerMm, by = H - 20;
-  cx.beginPath();
-  cx.moveTo(bx, by - 4); cx.lineTo(bx, by); cx.lineTo(bx + barMm*pxPerMm, by);
-  cx.lineTo(bx + barMm*pxPerMm, by - 4); cx.stroke();
-  cx.textAlign = 'center'; cx.textBaseline = 'bottom';
-  cx.fillText(`${barMm} mm`, bx + barMm*pxPerMm/2, by - 5);
+  cx.font = `${f}px ui-monospace, SFMono-Regular, Menlo, monospace`;
+  cx.textBaseline = 'middle';
   cx.textAlign = 'left';
-  cx.restore();
+  const pad = Math.round(10 * sc);
+  cx.fillText(`t = ${S.t.toFixed(2)} ms`, pad, headerH * 0.32);
+  cx.fillStyle = '#8b97a6';
+  cx.font = `${Math.round(11 * sc)}px ui-monospace, SFMono-Regular, Menlo, monospace`;
+  cx.fillText(`${usingComp() ? 'compressible Navier–Stokes' : 'incompressible'} · ` +
+              `bore ${fmt(P.boreR,1)} mm · exit ${fmt(P.exitR,1)} mm · ` +
+              `stroke ${fmt(Math.min(P.stroke, maxStroke()),0)} mm · L/D ${fmt(derived().LD,2)}`,
+              pad, headerH * 0.72);
+
+  const fy = headerH + simH;
+  const legW = Math.min(Math.round(260 * sc), Math.round(w * 0.42));
+  paintLegend(cx, pad, fy + Math.round(6*sc), legW, footerH - Math.round(12*sc),
+              S.colourScale || 1, Math.round(11 * sc));
+
+  // physical scale bar, on a round number of millimetres
+  const pxPerMm = w / S.Lz;
+  let barMm = Math.pow(10, Math.floor(Math.log10(S.Lz / 5)));
+  if (barMm * pxPerMm < w * 0.08) barMm *= 2;
+  if (barMm * pxPerMm > w * 0.30) barMm /= 2;
+  const bw = barMm * pxPerMm;
+  const bx = w - pad - bw, by = fy + footerH * 0.62;
+  cx.strokeStyle = '#dfe6ee'; cx.fillStyle = '#dfe6ee';
+  cx.lineWidth = Math.max(1, Math.round(1.5 * sc));
+  const tick = Math.round(5 * sc);
+  cx.beginPath();
+  cx.moveTo(bx, by - tick); cx.lineTo(bx, by); cx.lineTo(bx + bw, by); cx.lineTo(bx + bw, by - tick);
+  cx.stroke();
+  cx.textAlign = 'center'; cx.textBaseline = 'top';
+  cx.font = `${Math.round(11 * sc)}px ui-monospace, SFMono-Regular, Menlo, monospace`;
+  cx.fillText(`${barMm >= 1 ? barMm : barMm.toFixed(1)} mm`, bx + bw/2, by + Math.round(3*sc));
+  cx.textAlign = 'left'; cx.textBaseline = 'alphabetic';
 }
+
 </script>
 
 <script>

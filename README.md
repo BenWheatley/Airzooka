@@ -230,8 +230,17 @@ frame advances exactly the same simulated interval**, subdivided into as many eq
 as stability requires. The sub-step count varies between frames; the frame interval never
 does. Verified: 30 exported frames, all frame intervals exactly 0.2000000 ms.
 
-Frames carry a burned-in clock, the configuration, the colour legend and a physical scale bar,
-so a shared clip is self-describing.
+**The colour scale is fixed for the whole clip.** On screen the range tracks the flow, which
+is what you want while exploring; in a video it means a colour does not signify the same thing
+from one frame to the next, and the numbers under the legend visibly crawl. Export therefore
+runs the shot once first to find the peak, fixes the range from that, then records. It costs
+roughly double, and can be turned off — in which case the range is frozen at whatever the
+current frame shows, still constant but probably badly chosen.
+
+Frames carry a burned-in clock, the configuration, the colour legend and a physical scale bar.
+These sit in bands **above and below** the image rather than on top of it, so nothing obscures
+the flow and no semi-transparent backing panel is needed — the earlier version drew a
+fixed-width panel that longer captions overflowed.
 
 Set flight time to record, flight time per frame, frame rate, width and bitrate; the panel
 shows the resulting frame count, video length and slow-motion factor. Export settings are
