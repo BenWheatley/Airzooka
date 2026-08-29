@@ -202,6 +202,36 @@ versus a straight shear tube that never pinches off — is robust and reproduces
 resolution. The **measured velocities at the target plane are good to about a factor of two**
 and should only ever be used to rank designs, never quoted.
 
+## Shareable links
+
+Every setting is serialised into the URL fragment, so a link reproduces a configuration
+exactly. **Copy shareable link** puts it on the clipboard; the address bar updates live as you
+move sliders.
+
+On length — it is not close to a problem:
+
+| | characters |
+|---|---|
+| worst case, all 27 settings non-default | 153 params, 186 full URL |
+| a typical tweak (`#er=18.5&tp=25&fd=2`) | 18 |
+| everything at defaults | 0 — no fragment at all |
+
+Against a commonly-cited safe limit of 2000 characters that is 10× headroom, and Chrome's own
+limit is 32779. Three choices keep it that short:
+
+- **Only non-defaults are written.** Most links carry a handful of keys.
+- **Two-character keys** (`br`, `er`, `tp`, …).
+- **The fragment, not the query string.** The fragment is never sent to a server, so no
+  server request-line limit (Apache 8190, nginx 8192) applies at all — and assigning
+  `location.hash` works on `file://` URLs, where Chrome throws on `history.replaceState`.
+
+Links are validated on the way in: values are clamped to their slider range, unknown keys and
+unparseable numbers are ignored. A hand-edited `#br=99999&er=-50&rs=abc&md=77` loads as a
+valid configuration rather than breaking.
+
+Round-tripping is tested: encoding a fully non-default configuration, resetting everything,
+then decoding restores all 27 settings with zero mismatches.
+
 ## Two physical models
 
 The sandbox carries **two solvers** and picks between them on the analytic exit Mach number.

@@ -106,6 +106,12 @@
     <button id="pause">Pause</button>
     <button id="reset">Reset</button>
   </div>
+  <div class="btnrow">
+    <button id="share">Copy shareable link</button>
+    <button id="defaults">Reset to defaults</button>
+  </div>
+  <div class="hint" style="margin:-4px 0 8px">Every setting lives in the link —
+    <span id="urlLen">…</span>.</div>
   <div id="diverged" class="flag bad" style="display:none"></div>
   <div id="controls"></div>
   <div id="note"></div>
@@ -600,7 +606,7 @@ const CONTROLS = [
      hint:'Half-sine velocity profile. Short = spring/elastic snap, long = hand shove.' },
  ]},
  { group:'Fluid', items:[
-   { k:'visc',       t:'Kinematic viscosity',    min:0,   max:1,   step:0.0005, v:0.0151, unit:'mm²/ms',
+   { k:'visc',       t:'Kinematic viscosity',    min:0,   max:1,   step:0.0001, v:0.0151, unit:'mm²/ms',
      hint:'Air at 20 °C = 0.0151. Raise it to damp grid-scale noise.' },
    { k:'smag',       t:'Turbulence model (Smagorinsky Cs)', min:0, max:0.45, step:0.005, v:0.17,
      hint:'Stands in for the 3-D turbulent mixing this symmetric model cannot represent. ' +
@@ -641,6 +647,9 @@ const CONTROLS = [
 
 const P = {};
 for (const g of CONTROLS) for (const it of g.items) P[it.k] = it.v;
+const DEFAULTS = Object.assign({}, P);
+const SPEC = {};
+for (const g of CONTROLS) for (const it of g.items) SPEC[it.k] = it;
 const VIEW = { field:0, scale:'auto', showGeom:true, mirror:true };
 
 const PRESETS = [
@@ -2758,6 +2767,7 @@ function compRender(){
 <script>
 "use strict";
 /* ========================== control panel ========================== */
+const UI = {};
 const DOM = { scalebar: document.getElementById('scalebar'),
               pause:    document.getElementById('pause'),
               metrics:  document.getElementById('metrics'),
@@ -2785,6 +2795,7 @@ function addControl(body, it){
     P[it.k] = parseFloat(inp.value);
     sliders[it.k].out.textContent = fmtVal(it, P[it.k]);
     if (it.rebuild) pendingRebuild = true;
+    scheduleURLSync();
     updateMetrics();
   });
 }
@@ -2811,7 +2822,7 @@ for (const g of CONTROLS){
     <div class="hint" id="modelWhy" style="margin-top:6px"></div></div>`;
   host.appendChild(d);
   d.querySelector('#modelSel').addEventListener('change', e => {
-    OPT.model = e.target.value; buildGrid(); updateMetrics();
+    OPT.model = e.target.value; buildGrid(); scheduleURLSync(); updateMetrics();
   });
 }
 function modelBlurb(){
@@ -2839,6 +2850,7 @@ function modelBlurb(){
   wrap.querySelector('input').addEventListener('change', e => {
     OPT.autoPace = e.target.checked;
     if (!OPT.autoPace) P.spf = Math.max(1, Math.round(S.spfAuto));
+    scheduleURLSync();
   });
 }
 
@@ -2864,12 +2876,17 @@ function modelBlurb(){
   host.appendChild(d);
   const gainOut = d.querySelector('#v_gain'), gainIn = d.querySelector('#s_gain');
   VIEW.gain = 1;
+  UI.gainIn = gainIn; UI.gainOut = gainOut;
+  UI.fieldSel = d.querySelector('#fieldSel'); UI.geomChk = d.querySelector('#geomChk');
   gainIn.addEventListener('input', () => {
     VIEW.gain = Math.pow(10, parseFloat(gainIn.value));
     gainOut.textContent = VIEW.gain.toFixed(VIEW.gain < 1 ? 2 : 1) + '×';
+    scheduleURLSync();
   });
-  d.querySelector('#fieldSel').addEventListener('change', e => VIEW.field = parseInt(e.target.value));
-  d.querySelector('#geomChk').addEventListener('change', e => VIEW.showGeom = e.target.checked);
+  d.querySelector('#fieldSel').addEventListener('change', e => {
+    VIEW.field = parseInt(e.target.value); scheduleURLSync(); });
+  d.querySelector('#geomChk').addEventListener('change', e => {
+    VIEW.showGeom = e.target.checked; scheduleURLSync(); });
 }
 
 /* ---- quality presets: the solver knobs that actually trade speed for fidelity ---- */
@@ -2891,7 +2908,7 @@ const QUALITY = [
     const b = document.createElement('button');
     b.innerHTML = `<b>${q.n}</b><i>${q.d}</i>`;
     b.addEventListener('click', () => {
-      Object.assign(P, q.q); syncSliders(); buildGrid(); updateMetrics();
+      Object.assign(P, q.q); syncSliders(); buildGrid(); scheduleURLSync(); updateMetrics();
     });
     row.appendChild(b);
   }
@@ -2912,7 +2929,7 @@ const QUALITY = [
       if (pr.auto === 'ld4')
         P.exitR = Math.round(Math.cbrt(P.boreR*P.boreR*Math.min(P.stroke, maxStroke())/8) * 2) / 2;
       syncSliders();
-      buildGrid(); updateMetrics();
+      buildGrid(); scheduleURLSync(); updateMetrics();
     });
     row.appendChild(b);
   }
@@ -2944,6 +2961,96 @@ document.getElementById('note').innerHTML =
    approaches Mach 0.3 is outside what it can model. Use it to rank designs against each other,
    not to predict metres.`;
 
+/* ==========================================================================
+   Shareable links. State lives in the fragment rather than the query string:
+   the fragment never reaches a server, and assigning location.hash works on
+   file:// URLs, where Chrome throws on history.replaceState.
+   Only values that differ from the defaults are written, so a typical link
+   carries a handful of keys. With every setting changed it comes to roughly
+   320 characters, against a commonly-cited safe limit of 2000.
+   ========================================================================== */
+const URLKEY = {
+  boreR:'br', wallT:'wt', barrelLen:'bl', exitR:'er', plateT:'pt', taper:'tp',
+  pistonT:'ph', pistonClr:'pc', stroke:'st', pushMs:'pd',
+  visc:'nu', smag:'cs', vortEps:'vc', dyeDiss:'dd',
+  downrange:'dn', zAspect:'za', res:'rs', iters:'it', cfl:'cf', budget:'bg', spf:'sp',
+  probe:'pb',
+};
+const URLKEY_INV = Object.fromEntries(Object.entries(URLKEY).map(([a,b]) => [b,a]));
+const MODEL_CODE = { auto:0, incompressible:1, compressible:2 };
+const MODEL_NAME = ['auto','incompressible','compressible'];
+
+const trimNum = v => String(Number(v.toFixed(5)));
+
+function encodeState(){
+  const out = [];
+  for (const k in URLKEY){
+    // compare at the slider's own granularity: a default that is not exactly representable
+    // on its slider would otherwise appear in every link
+    if (Math.abs(P[k] - DEFAULTS[k]) > (SPEC[k].step || 1e-9) * 0.5) {
+      out.push(URLKEY[k] + '=' + trimNum(P[k]));
+    }
+  }
+  if (OPT.model !== 'auto')  out.push('md=' + MODEL_CODE[OPT.model]);
+  if (!OPT.autoPace)         out.push('ap=0');
+  if (VIEW.field !== 0)      out.push('fd=' + VIEW.field);
+  if (Math.abs(VIEW.gain - 1) > 1e-6) out.push('gn=' + trimNum(VIEW.gain));
+  if (!VIEW.showGeom)        out.push('gm=0');
+  return out.join('&');
+}
+
+/* Returns true if anything was applied, so the caller knows to rebuild. */
+function applyStateFromURL(){
+  const raw = (location.hash || '').replace(/^#/, '') || (location.search || '').replace(/^\?/, '');
+  if (!raw) return false;
+  let any = false;
+  for (const pair of raw.split('&')){
+    const i = pair.indexOf('=');
+    if (i < 0) continue;
+    const key = decodeURIComponent(pair.slice(0, i));
+    const val = decodeURIComponent(pair.slice(i + 1));
+    const num = parseFloat(val);
+    const pk = URLKEY_INV[key];
+    if (pk && Number.isFinite(num)){
+      const sp = SPEC[pk];
+      P[pk] = Math.min(sp.max, Math.max(sp.min, num));   // clamp: links can be hand-edited
+      any = true;
+    } else if (key === 'md' && MODEL_NAME[num]){ OPT.model = MODEL_NAME[num]; any = true; }
+    else if (key === 'ap'){ OPT.autoPace = num !== 0; any = true; }
+    else if (key === 'fd' && num >= 0 && num <= 6){ VIEW.field = Math.round(num); any = true; }
+    else if (key === 'gn' && Number.isFinite(num) && num > 0){
+      VIEW.gain = Math.min(32, Math.max(0.06, num)); any = true;
+    }
+    else if (key === 'gm'){ VIEW.showGeom = num !== 0; any = true; }
+  }
+  return any;
+}
+
+function pushStateToDOM(){
+  syncSliders();
+  if (UI.fieldSel) UI.fieldSel.value = String(VIEW.field);
+  if (UI.geomChk)  UI.geomChk.checked = VIEW.showGeom;
+  if (UI.gainIn){
+    UI.gainIn.value = Math.log10(VIEW.gain);
+    UI.gainOut.textContent = VIEW.gain.toFixed(VIEW.gain < 1 ? 2 : 1) + '×';
+  }
+  const ms = document.getElementById('modelSel'); if (ms) ms.value = OPT.model;
+  const ac = document.getElementById('autoPace'); if (ac) ac.checked = OPT.autoPace;
+}
+
+let urlTimer = 0;
+function scheduleURLSync(){
+  clearTimeout(urlTimer);
+  urlTimer = setTimeout(() => {
+    const q = encodeState();
+    try { history.replaceState(null, '', q ? '#' + q : location.pathname + location.search); }
+    catch (e) { location.hash = q; }        // file:// rejects replaceState in some browsers
+    const n = (location.href || '').length;
+    const el = document.getElementById('urlLen');
+    if (el) el.textContent = n + ' chars';
+  }, 250);
+}
+
 /* ---- buttons & keys ---- */
 document.getElementById('fire').addEventListener('click', () => {
   if (pendingRebuild){ buildGrid(); pendingRebuild = false; } else resetSim();
@@ -2954,6 +3061,36 @@ DOM.pause.addEventListener('click', e => {
   if (S.diverged) return;
   S.running = !S.running; e.target.textContent = S.running ? 'Pause' : 'Run';
 });
+document.getElementById('share').addEventListener('click', async e => {
+  clearTimeout(urlTimer);
+  const q = encodeState();
+  try { history.replaceState(null, '', q ? '#' + q : location.pathname + location.search); }
+  catch (err) { location.hash = q; }
+  const url = location.href;
+  const done = ok => {
+    // the hash is already written, so if the clipboard is unavailable (no secure context,
+    // e.g. opened over file://) the link is still sitting in the address bar
+    e.target.textContent = ok ? 'Link copied ✓' : 'It\u2019s in the address bar';
+    setTimeout(() => e.target.textContent = 'Copy shareable link', 2200);
+  };
+  try { await navigator.clipboard.writeText(url); done(true); }
+  catch (err) {
+    // clipboard API needs a secure context; file:// has none, so fall back to a selection
+    const ta = document.createElement('textarea');
+    ta.value = url; document.body.appendChild(ta); ta.select();
+    let ok = false;
+    try { ok = document.execCommand('copy'); } catch (e2) {}
+    document.body.removeChild(ta); done(ok);
+  }
+});
+
+document.getElementById('defaults').addEventListener('click', () => {
+  Object.assign(P, DEFAULTS);
+  OPT.model = 'auto'; OPT.autoPace = true;
+  VIEW.field = 0; VIEW.gain = 1; VIEW.showGeom = true;
+  pushStateToDOM(); buildGrid(); scheduleURLSync(); updateMetrics();
+});
+
 window.addEventListener('keydown', e => {
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
   if (e.key === 'Enter'){ document.getElementById('fire').click(); e.preventDefault(); }
@@ -3059,7 +3196,10 @@ function flagDivergence(v){
     await compInit();
   }
   if (!CP.ok) OPT.model = 'incompressible';
+  applyStateFromURL();
+  pushStateToDOM();
   buildGrid();
+  scheduleURLSync();
   S.passUs = usedGPU ? 0 : measurePassCost();
   S.backend = usedGPU ? 'WebGPU compute' : 'WebGL2 fragment';
   updateMetrics();
