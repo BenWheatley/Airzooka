@@ -26,6 +26,8 @@
        text-shadow:0 1px 3px #000; pointer-events:none; white-space:pre}
   #scalebar{position:absolute; right:10px; bottom:8px; font:11px var(--mono); color:#9fb2c4;
             text-shadow:0 1px 3px #000; pointer-events:none}
+  #legend{position:absolute; left:10px; bottom:8px; pointer-events:none;
+          width:220px; height:38px}
   #bottom{flex:0 0 190px; display:flex; gap:10px; align-items:stretch; min-height:190px}
   #plotBox{flex:1 1 auto; background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:6px 8px}
   #plot{width:100%; height:110px; display:block}
@@ -87,6 +89,7 @@
     <canvas id="view"></canvas>
     <canvas id="viewgpu" style="display:none"></canvas>
     <div id="hud"></div>
+    <canvas id="legend" width="440" height="76"></canvas>
     <div id="scalebar"></div>
   </div>
   <div id="bottom">
@@ -110,7 +113,7 @@
     <button id="share">Copy shareable link</button>
     <button id="defaults">Reset to defaults</button>
   </div>
-  <div class="hint" style="margin:-4px 0 8px">Every setting lives in the link —
+  <div class="hint" style="margin:-4px 0 8px">Every physical setting lives in the link —
     <span id="urlLen">…</span>.</div>
   <div id="diverged" class="flag bad" style="display:none"></div>
   <div id="controls"></div>
@@ -640,6 +643,15 @@ const CONTROLS = [
    { k:'spf',        t:'Steps / frame (manual)', min:1,   max:400, step:1,    v:40,
      hint:'Only used when auto-pacing is off.' },
  ]},
+ { group:'Video export', items:[
+   { k:'vidFlight',     t:'Flight time to record', min:1, max:400, step:1, v:60, unit:'ms' },
+   { k:'vidMsPerFrame', t:'Flight time per frame', min:0.005, max:2, step:0.005, v:0.05, unit:'ms',
+     hint:'Constant by construction: every frame advances exactly this much, subdivided into ' +
+          'as many equal sub-steps as stability needs. The adaptive timestep is switched off.' },
+   { k:'vidFps',        t:'Video frame rate',   min:12, max:60, step:1, v:30, unit:'fps' },
+   { k:'vidWidth',      t:'Video width',        min:480, max:1920, step:80, v:1280, unit:'px' },
+   { k:'vidMbps',       t:'Bitrate',            min:1, max:40, step:1, v:12, unit:'Mb/s' },
+ ]},
  { group:'Measurement', items:[
    { k:'probe',      t:'Target distance from muzzle', min:10, max:1000, step:5, v:150, unit:'mm' },
  ]},
@@ -668,6 +680,7 @@ const S = {
   series:[], peak:0, peakT:-1, arrival:-1,
   spfAuto:8, wallSmooth:16, simRate:0, passUs:0, diverged:false,
 };
+var FIXED_DT = null, EXPORTING = false;
 const OPT = { autoPace:true, model:'auto' };
 /* Neither model is right everywhere. Incompressible is exact-in-the-limit below about
    Mach 0.3 and roughly six times faster there, because it does not have to resolve
@@ -865,6 +878,7 @@ function jacobiSweeps(n){
    radial motion by dr. Using min(dz,dr) against a single scalar max|u| throws away most of
    the timestep a stretched grid earns. */
 function chooseDt(){
+  if (FIXED_DT !== null) return FIXED_DT;
   const k  = pistonKinematics(S.t);
   const ar = Math.pow(P.boreR / Math.max(P.exitR, 0.5), 2);
   const vz = Math.max(S.vzmax*1.2, Math.abs(k.v)*ar, 0.3);
@@ -978,6 +992,7 @@ function render(){
     case 4: base = Math.max(S.vmax * 0.75, 1e-3); break;
     default: base = 1;
   }
+  S.colourScale = base / g;
   run(PROG.show, null,
       { uVel:S.vel.read.tex, uDye:S.dye.read.tex, uVort:S.vort.read.tex, uPres:S.pres.read.tex },
       p => {
@@ -1082,6 +1097,97 @@ function updateMetrics(){
     ]) + '</div>' +
     rest.map(([c,t]) => `<div class="flag ${c}">${t}</div>`).join('');
   modelBlurb();
+}
+
+/* ========================== colour legend ==========================
+   The colour maps are duplicated from the shaders rather than shared, because one lives in
+   WGSL and the other in GLSL. They must stay in step; the fits below are the same
+   polynomials. */
+function viridisJS(t){
+  t = Math.min(1, Math.max(0, t));
+  const c = [[0.2777,0.0054,0.3341],[0.1051,1.4046,1.3846],[-0.3309,0.2148,0.0951],
+             [-4.6342,-5.7991,-19.3324],[6.2283,14.1799,56.6906],
+             [4.7764,-13.7451,-65.3530],[-5.4355,4.6459,26.3124]];
+  const o = [0,0,0];
+  for (let i = 0; i < 3; i++){
+    let v = c[6][i];
+    for (let k = 5; k >= 0; k--) v = c[k][i] + t * v;
+    o[i] = Math.min(1, Math.max(0, v));
+  }
+  return o;
+}
+function divergingJS(t){
+  const a = Math.min(1, Math.abs(t));
+  const c = t < 0 ? [0.25,0.55,1.0] : [1.0,0.42,0.25];
+  const bg = [0.055,0.07,0.09], k = Math.pow(a, 0.75);
+  return [0,1,2].map(i => bg[i] + (c[i] - bg[i]) * k);
+}
+const rgb = c => `rgb(${Math.round(c[0]*255)},${Math.round(c[1]*255)},${Math.round(c[2]*255)})`;
+
+/* What each field means, and in what units. `scale` is the shader's own colour scale. */
+function legendSpec(scale){
+  const comp = usingComp();
+  switch (VIEW.field){
+    case 0: return { name:'tracer — barrel air', unit:'fraction', lo:0, hi:1, map:'grey' };
+    case 1: return { name:'speed |u|', unit:'m/s', lo:0, hi:scale, map:'viridis' };
+    case 2: return { name:'vorticity  ω_θ', unit:'1/ms', lo:-scale, hi:scale, map:'div' };
+    case 3: return comp
+      ? { name:'pressure  p − p₀', unit:'Pa', lo:-scale, hi:scale, map:'div' }
+      : { name:'pressure (kinematic, ρ=1)', unit:'m²/s²', lo:-scale, hi:scale, map:'div' };
+    case 4: return { name:'axial velocity  u_z', unit:'m/s', lo:-scale, hi:scale, map:'div' };
+    case 5: return { name:'Mach number', unit:'—  (white line at M=1)', lo:0, hi:scale, map:'viridis' };
+    default: return { name:'schlieren  |∇ρ|', unit:'relative', lo:0, hi:1, map:'grey' };
+  }
+}
+const legendCv = document.getElementById('legend');
+const lctx = legendCv.getContext('2d');
+function fmtTick(v){
+  const a = Math.abs(v);
+  if (a === 0) return '0';
+  if (a >= 1000) return (v/1000).toFixed(1) + 'k';
+  if (a >= 10) return v.toFixed(0);
+  if (a >= 1) return v.toFixed(1);
+  if (a >= 0.01) return v.toFixed(2);
+  return v.toExponential(1);
+}
+function drawLegend(scale){
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = 220, h = 38;
+  if (legendCv.width !== Math.round(w*dpr)){
+    legendCv.width = Math.round(w*dpr); legendCv.height = Math.round(h*dpr);
+  }
+  lctx.setTransform(dpr,0,0,dpr,0,0);
+  lctx.clearRect(0,0,w,h);
+  const sp = legendSpec(scale);
+  const bx = 4, by = 15, bw = w - 8, bh = 9;
+
+  for (let i = 0; i < bw; i++){
+    const t = i / (bw - 1);
+    let c;
+    if (sp.map === 'viridis') c = viridisJS(t);
+    else if (sp.map === 'div') c = divergingJS(t * 2 - 1);
+    else c = [t, t, t];
+    lctx.fillStyle = rgb(c);
+    lctx.fillRect(bx + i, by, 1, bh);
+  }
+  lctx.strokeStyle = 'rgba(255,255,255,0.25)'; lctx.lineWidth = 1;
+  lctx.strokeRect(bx + 0.5, by + 0.5, bw - 1, bh - 1);
+
+  lctx.fillStyle = '#c8d4e0';
+  lctx.font = '10px ui-monospace, SFMono-Regular, Menlo, monospace';
+  lctx.textBaseline = 'alphabetic';
+  lctx.fillText(sp.name, bx, by - 4);
+  lctx.textAlign = 'right';
+  lctx.fillStyle = '#8b97a6';
+  lctx.fillText(sp.unit, bx + bw, by - 4);
+  lctx.textAlign = 'left';
+  lctx.fillStyle = '#c8d4e0';
+  lctx.fillText(fmtTick(sp.lo), bx, by + bh + 10);
+  lctx.textAlign = 'center';
+  lctx.fillText(fmtTick((sp.lo + sp.hi) / 2), bx + bw/2, by + bh + 10);
+  lctx.textAlign = 'right';
+  lctx.fillText(fmtTick(sp.hi), bx + bw, by + bh + 10);
+  lctx.textAlign = 'left';
 }
 
 /* ========================== time-series plot ========================== */
@@ -1928,7 +2034,7 @@ function wgpuReset(){
   dev.queue.submit([enc.finish()]);
 }
 
-function wgpuRender(){
+function wgpuRender(targetView, outW, outH){
   const dev = WG.dev;
   const cv = WG.canvas;
   const w = cv.width, h = cv.height;
@@ -1941,15 +2047,16 @@ function wgpuRender(){
     case 4: base = Math.max(S.vmax * 0.75, 1e-3); break;
     default: base = 1;
   }
+  S.colourScale = base / g;
   const su = new Float32Array(8);
-  su[0] = w; su[1] = h; su[2] = VIEW.field; su[3] = base / g;
+  su[0] = outW || w; su[1] = outH || h; su[2] = VIEW.field; su[3] = base / g;
   su[4] = VIEW.showGeom ? 1 : 0;
   su[5] = Math.min(S.Lz - S.dz, S.Z1 + P.plateT + P.probe);
   dev.queue.writeBuffer(WG.buf.showU, 0, su);
 
   const enc = dev.createCommandEncoder();
   const pass = enc.beginRenderPass({ colorAttachments:[{
-    view: WG.ctx.getCurrentTexture().createView(),
+    view: targetView || WG.ctx.getCurrentTexture().createView(),
     clearValue:{ r:0.02, g:0.03, b:0.04, a:1 }, loadOp:'clear', storeOp:'store' }] });
   pass.setPipeline(WG.pipe.show);
   pass.setBindGroup(0, WG.bgP, [0]);
@@ -2626,6 +2733,7 @@ function compParams(slot, dt, weight){
 }
 
 function compChooseDt(){
+  if (FIXED_DT !== null) return FIXED_DT;
   const cfl = Math.min(P.cfl, 0.6);           // MUSCL + SSP-RK2 acoustic limit
   return Math.min(0.5, cfl / Math.max(CP.waveMax, 1e-6));
 }
@@ -2729,7 +2837,7 @@ function compSteps(n){
   return simmed;
 }
 
-function compRender(){
+function compRender(targetView, outW, outH){
   const dev = WG.dev, cv = WG.canvas;
   const g = VIEW.gain;
   let base;
@@ -2742,8 +2850,9 @@ function compRender(){
     case 6: base = Math.max(AIR.rho0 * 0.35 / Math.min(S.dz, S.dr), 1e-3); break;
     default: base = 1;
   }
+  S.colourScale = base / g;
   const su = new Float32Array(8);
-  su[0] = cv.width; su[1] = cv.height; su[2] = VIEW.field; su[3] = base / g;
+  su[0] = outW || cv.width; su[1] = outH || cv.height; su[2] = VIEW.field; su[3] = base / g;
   su[4] = VIEW.showGeom ? 1 : 0;
   su[5] = Math.min(S.Lz - S.dz, S.Z1 + P.plateT + P.probe);
   dev.queue.writeBuffer(WG.buf.showU, 0, su);
@@ -2752,7 +2861,7 @@ function compRender(){
 
   const enc = dev.createCommandEncoder();
   const pass = enc.beginRenderPass({ colorAttachments:[{
-    view: WG.ctx.getCurrentTexture().createView(),
+    view: targetView || WG.ctx.getCurrentTexture().createView(),
     clearValue:{ r:0.02, g:0.03, b:0.04, a:1 }, loadOp:'clear', storeOp:'store' }] });
   pass.setPipeline(CP.pipe.show);
   pass.setBindGroup(0, WG.bgP, [0]);
@@ -2761,6 +2870,350 @@ function compRender(){
   pass.draw(3);
   pass.end();
   dev.queue.submit([enc.finish()]);
+}
+</script>
+
+<script>
+"use strict";
+/* ==========================================================================
+   Video export.
+
+   The interactive solver picks its timestep adaptively, which is right on
+   screen but wrong for video: frames would represent unequal slices of time
+   and the motion would be subtly wrong. So export runs on a fixed schedule --
+   every video frame advances exactly the same simulated interval, subdivided
+   into however many equal sub-steps stability requires.
+
+   WebCodecs gives encoded chunks but no container, so there is a minimal
+   Matroska/WebM muxer below: one video track, SimpleBlocks in Clusters.
+   ========================================================================== */
+
+/* ---- EBML primitives ---- */
+function ebmlVint(n){
+  let len = 1;
+  while (n >= Math.pow(2, 7 * len) - 1) len++;
+  const b = new Uint8Array(len);
+  let v = n;
+  for (let i = len - 1; i >= 0; i--){ b[i] = v & 0xff; v = Math.floor(v / 256); }
+  b[0] |= 1 << (8 - len);
+  return b;
+}
+function ebmlUint(n){
+  const out = [];
+  let v = Math.round(n);
+  do { out.unshift(v & 0xff); v = Math.floor(v / 256); } while (v > 0);
+  return new Uint8Array(out);
+}
+function ebmlFloat(x){
+  const b = new Uint8Array(8);
+  new DataView(b.buffer).setFloat64(0, x, false);
+  return b;
+}
+const ebmlStr = t => new TextEncoder().encode(t);
+function bytesJoin(list){
+  let n = 0; for (const a of list) n += a.length;
+  const out = new Uint8Array(n);
+  let o = 0; for (const a of list){ out.set(a, o); o += a.length; }
+  return out;
+}
+function ebmlElem(id, data){
+  const idb = new Uint8Array(id), sz = ebmlVint(data.length);
+  return bytesJoin([idb, sz, data]);
+}
+
+function webmMux(frames, width, height, fps, codecId){
+  const header = ebmlElem([0x1A,0x45,0xDF,0xA3], bytesJoin([
+    ebmlElem([0x42,0x86], ebmlUint(1)),
+    ebmlElem([0x42,0xF7], ebmlUint(1)),
+    ebmlElem([0x42,0xF2], ebmlUint(4)),
+    ebmlElem([0x42,0xF3], ebmlUint(8)),
+    ebmlElem([0x42,0x82], ebmlStr('webm')),
+    ebmlElem([0x42,0x87], ebmlUint(2)),
+    ebmlElem([0x42,0x85], ebmlUint(2)),
+  ]));
+  const durMs = frames.length * 1000 / fps;
+  const info = ebmlElem([0x15,0x49,0xA9,0x66], bytesJoin([
+    ebmlElem([0x2A,0xD7,0xB1], ebmlUint(1000000)),          // 1 ms timecode scale
+    ebmlElem([0x4D,0x80], ebmlStr('airzooka')),
+    ebmlElem([0x57,0x41], ebmlStr('airzooka')),
+    ebmlElem([0x44,0x89], ebmlFloat(durMs)),
+  ]));
+  const tracks = ebmlElem([0x16,0x54,0xAE,0x6B], ebmlElem([0xAE], bytesJoin([
+    ebmlElem([0xD7], ebmlUint(1)),
+    ebmlElem([0x73,0xC5], ebmlUint(1)),
+    ebmlElem([0x83], ebmlUint(1)),                          // video
+    ebmlElem([0x9C], ebmlUint(0)),                          // no lacing
+    ebmlElem([0x86], ebmlStr(codecId)),
+    ebmlElem([0x23,0xE3,0x83], ebmlUint(Math.round(1e9 / fps))),
+    ebmlElem([0xE0], bytesJoin([
+      ebmlElem([0xB0], ebmlUint(width)),
+      ebmlElem([0xBA], ebmlUint(height)),
+    ])),
+  ])));
+
+  const clusters = [];
+  let cur = null, curTime = 0;
+  const flushCluster = () => {
+    if (!cur || !cur.length) return;
+    clusters.push(ebmlElem([0x1F,0x43,0xB6,0x75],
+      bytesJoin([ebmlElem([0xE7], ebmlUint(curTime)), ...cur])));
+    cur = null;
+  };
+  for (const f of frames){
+    const tMs = Math.round(f.timestamp / 1000);
+    // a cluster must start on a keyframe, and its block offsets are a signed 16-bit ms
+    if (!cur || (f.key && tMs - curTime > 1000) || tMs - curTime > 30000){
+      flushCluster(); cur = []; curTime = tMs;
+    }
+    const tn = ebmlVint(1);
+    const blk = new Uint8Array(tn.length + 3 + f.data.length);
+    blk.set(tn, 0);
+    new DataView(blk.buffer).setInt16(tn.length, tMs - curTime, false);
+    blk[tn.length + 2] = f.key ? 0x80 : 0x00;
+    blk.set(f.data, tn.length + 3);
+    cur.push(ebmlElem([0xA3], blk));
+  }
+  flushCluster();
+
+  const segment = ebmlElem([0x18,0x53,0x80,0x67], bytesJoin([info, tracks, ...clusters]));
+  return new Blob([header, segment], { type:'video/webm' });
+}
+
+/* ---- fixed-timestep advance ---------------------------------------------
+   FIXED_DT overrides the adaptive chooser. Each video frame covers exactly
+   msPerFrame of flight, split into equal sub-steps small enough for stability.
+   The sub-step count may vary between frames; the frame interval never does. */
+async function currentDtLimit(){
+  const dev = WG.dev;
+  if (!dev) return 0.01;
+  await dev.queue.onSubmittedWorkDone();
+  const src = usingComp() ? CP.red[CP.red.length-1].out : WG.redLevels[WG.redLevels.length-1].out;
+  if (!EXP.readBuf) EXP.readBuf = dev.createBuffer({ size:8,
+    usage:GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  const enc = dev.createCommandEncoder();
+  enc.copyBufferToBuffer(src, 0, EXP.readBuf, 0, 8);
+  dev.queue.submit([enc.finish()]);
+  await EXP.readBuf.mapAsync(GPUMapMode.READ);
+  const m = new Float32Array(EXP.readBuf.getMappedRange().slice(0));
+  EXP.readBuf.unmap();
+  if (usingComp()){
+    if (Number.isFinite(m[0]) && m[0] > 0) CP.waveMax = m[0];
+    if (Number.isFinite(m[1])) { CP.machMax = m[1]; S.vmax = m[1]*AIR.a0; }
+    return compChooseDt();
+  }
+  if (Number.isFinite(m[0])) S.vrmax = Math.max(m[0], 0.05);
+  if (Number.isFinite(m[1])) S.vzmax = Math.max(m[1], 0.05);
+  S.vmax = Math.max(S.vrmax, S.vzmax);
+  return chooseDt();
+}
+
+async function advanceExactly(ms){
+  const limit = Math.max(await currentDtLimit(), 1e-9);
+  const nSub = Math.max(1, Math.ceil(ms / limit));
+  FIXED_DT = ms / nSub;
+  let left = nSub;
+  const batch = usingComp() ? 512 : 1024;
+  while (left > 0){
+    const n = Math.min(left, batch);
+    if (usingComp()) compSteps(n); else if (WG.ok) wgpuSteps(n);
+    else { for (let i = 0; i < n; i++) step(FIXED_DT); }
+    left -= n;
+  }
+  FIXED_DT = null;
+  return nSub;
+}
+
+/* ---- the exporter ---- */
+const EXP = { running:false, cancel:false, readBuf:null, tex:null, buf:null, tw:0, th:0 };
+
+/* A WebGPU canvas does not present until a task boundary, so drawImage() straight after
+   submit() yields a blank frame. Render into our own texture and copy it out instead:
+   deterministic, and it works at any resolution without touching the visible canvas. */
+async function exportGrab(w, h){
+  const dev = WG.dev;
+  if (!WG.ok){
+    canvas.width = w; canvas.height = h;
+    render();
+    const px = new Uint8Array(w * h * 4);
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    const out = new Uint8ClampedArray(w * h * 4);          // GL origin is bottom-left
+    for (let y = 0; y < h; y++) out.set(px.subarray((h-1-y)*w*4, (h-y)*w*4), y*w*4);
+    return out;
+  }
+  if (!EXP.tex || EXP.tw !== w || EXP.th !== h){
+    if (EXP.tex) EXP.tex.destroy();
+    if (EXP.buf) EXP.buf.destroy();
+    EXP.tex = dev.createTexture({ size:[w, h], format:WG.fmt,
+      usage:GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+    EXP.bpr = Math.ceil(w * 4 / 256) * 256;                // copy rows must be 256-aligned
+    EXP.buf = dev.createBuffer({ size:EXP.bpr * h,
+      usage:GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    EXP.tw = w; EXP.th = h;
+  }
+  const view = EXP.tex.createView();
+  if (usingComp()) compRender(view, w, h); else wgpuRender(view, w, h);
+  const enc = dev.createCommandEncoder();
+  enc.copyTextureToBuffer({ texture:EXP.tex },
+    { buffer:EXP.buf, bytesPerRow:EXP.bpr, rowsPerImage:h }, [w, h, 1]);
+  dev.queue.submit([enc.finish()]);
+  await EXP.buf.mapAsync(GPUMapMode.READ);
+  const src = new Uint8Array(EXP.buf.getMappedRange());
+  const out = new Uint8ClampedArray(w * h * 4);
+  const swap = WG.fmt === 'bgra8unorm';
+  for (let y = 0; y < h; y++){
+    const so = y * EXP.bpr, dof = y * w * 4;
+    for (let x = 0; x < w; x++){
+      const a = so + x*4, b = dof + x*4;
+      if (swap){ out[b] = src[a+2]; out[b+1] = src[a+1]; out[b+2] = src[a]; }
+      else      { out[b] = src[a];   out[b+1] = src[a+1]; out[b+2] = src[a+2]; }
+      out[b+3] = 255;
+    }
+  }
+  EXP.buf.unmap();
+  return out;
+}
+
+function expLog(msg){
+  const el = document.getElementById('expStatus');
+  if (el) el.innerHTML = msg;
+}
+
+async function exportVideo(){
+  if (EXP.running) { EXP.cancel = true; return; }
+  if (typeof VideoEncoder === 'undefined'){
+    expLog('<span style="color:var(--bad)">This browser has no WebCodecs VideoEncoder.</span>');
+    return;
+  }
+  const flightMs   = P.vidFlight;
+  const fps        = Math.round(P.vidFps);
+  const msPerFrame = P.vidMsPerFrame;
+  const total      = Math.max(1, Math.round(flightMs / msPerFrame));
+  const width      = Math.round(P.vidWidth / 2) * 2;
+  const height     = Math.max(2, Math.round(width * (2*S.Rmax) / S.Lz / 2) * 2);
+
+  EXP.running = true; EXP.cancel = false;
+  const btn = document.getElementById('expBtn');
+  btn.textContent = 'Cancel export';
+  const wasRunning = S.running;
+  S.running = false;
+  EXPORTING = true;
+
+  // render target at export resolution, plus a 2D canvas to composite overlays onto
+  const live = WG.ok ? WG.canvas : canvas;
+  const savedW = live.width, savedH = live.height;
+  const savedStyleW = live.style.width, savedStyleH = live.style.height;
+  const comp = document.createElement('canvas');
+  comp.width = width; comp.height = height;
+  const cx = comp.getContext('2d');
+
+  const frames = [];
+  let encoder = null, encErr = null;
+  const codec = 'vp09.00.10.08', codecId = 'V_VP9';
+  try {
+    encoder = new VideoEncoder({
+      output: (chunk) => {
+        const buf = new Uint8Array(chunk.byteLength);
+        chunk.copyTo(buf);
+        frames.push({ data:buf, timestamp:chunk.timestamp, key:chunk.type === 'key' });
+      },
+      error: (e) => { encErr = e; },
+    });
+    encoder.configure({ codec, width, height,
+      bitrate: Math.round(P.vidMbps * 1e6), framerate: fps,
+      latencyMode:'quality' });
+
+    buildGrid();                                  // deterministic start
+    await new Promise(r => setTimeout(r, 0));
+
+    const t0 = performance.now();
+    for (let i = 0; i < total; i++){
+      if (EXP.cancel || encErr) break;
+      const nSub = await advanceExactly(msPerFrame);
+      const px = await exportGrab(width, height);
+      cx.putImageData(new ImageData(px, width, height), 0, 0);
+      drawOverlay(cx, width, height);
+
+      const vf = new VideoFrame(comp, {
+        timestamp: Math.round(i * 1e6 / fps),
+        duration: Math.round(1e6 / fps),
+      });
+      encoder.encode(vf, { keyFrame: i % Math.max(1, fps * 2) === 0 });
+      vf.close();
+      while (encoder.encodeQueueSize > 6) await new Promise(r => setTimeout(r, 1));
+
+      if (i % 5 === 0 || i === total - 1){
+        const pct = ((i + 1) / total * 100).toFixed(0);
+        const el = performance.now() - t0;
+        const eta = (el / (i + 1)) * (total - i - 1) / 1000;
+        expLog(`frame ${i+1}/${total} (${pct}%) · ${nSub} sub-steps · ` +
+               `t = ${S.t.toFixed(2)} ms · ${eta.toFixed(0)} s left`);
+        await new Promise(r => setTimeout(r, 0));
+      }
+    }
+    await encoder.flush();
+  } catch (e){
+    encErr = e;
+  } finally {
+    if (encoder && encoder.state !== 'closed') { try { encoder.close(); } catch(e){} }
+    live.width = savedW; live.height = savedH;
+    live.style.width = savedStyleW; live.style.height = savedStyleH;
+    EXPORTING = false;
+    EXP.running = false;
+    btn.textContent = 'Export video';
+    S.running = wasRunning;
+    resizeCanvas();
+  }
+
+  if (encErr){
+    expLog(`<span style="color:var(--bad)">Encoder error: ${encErr.message || encErr}</span>`);
+    return;
+  }
+  if (!frames.length){ expLog('Cancelled — nothing written.'); return; }
+
+  const blob = webmMux(frames, width, height, fps, codecId);
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `airzooka_${Math.round(P.exitR*10)/10}mm_${flightMs}ms.webm`;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
+  expLog(`Done — ${frames.length} frames, ${(blob.size/1e6).toFixed(1)} MB, ` +
+         `${(frames.length/fps).toFixed(1)} s of video.`);
+}
+
+/* Burned-in overlay: without it an exported clip has no scale and no clock. */
+function drawOverlay(cx, w, h){
+  const s = Math.max(1, w / 900);
+  cx.save();
+  cx.scale(s, s);
+  const W = w / s, H = h / s;
+  cx.font = '13px ui-monospace, SFMono-Regular, Menlo, monospace';
+  cx.textBaseline = 'top';
+  const lines = [
+    `t = ${S.t.toFixed(2)} ms`,
+    `${usingComp() ? 'compressible' : 'incompressible'} · bore ${fmt(P.boreR,1)} mm · ` +
+    `exit ${fmt(P.exitR,1)} mm · L/D ${fmt(derived().LD,2)}`,
+  ];
+  cx.fillStyle = 'rgba(0,0,0,0.45)';
+  cx.fillRect(6, 6, 330, 6 + lines.length * 17);
+  cx.fillStyle = '#dfe6ee';
+  lines.forEach((t, i) => cx.fillText(t, 12, 11 + i * 17));
+  // colour legend, drawn from the same canvas the UI uses
+  drawLegend(S.colourScale || 1);
+  cx.drawImage(legendCv, 8, H - 46, 220, 38);
+  // physical scale bar: a round number of millimetres
+  const pxPerMm = W / S.Lz;
+  let barMm = Math.pow(10, Math.floor(Math.log10(S.Lz / 5)));
+  if (barMm * pxPerMm < W * 0.1) barMm *= 2;
+  cx.strokeStyle = '#dfe6ee'; cx.fillStyle = '#dfe6ee'; cx.lineWidth = 1.5;
+  const bx = W - 20 - barMm * pxPerMm, by = H - 20;
+  cx.beginPath();
+  cx.moveTo(bx, by - 4); cx.lineTo(bx, by); cx.lineTo(bx + barMm*pxPerMm, by);
+  cx.lineTo(bx + barMm*pxPerMm, by - 4); cx.stroke();
+  cx.textAlign = 'center'; cx.textBaseline = 'bottom';
+  cx.fillText(`${barMm} mm`, bx + barMm*pxPerMm/2, by - 5);
+  cx.textAlign = 'left';
+  cx.restore();
 }
 </script>
 
@@ -2809,6 +3262,32 @@ for (const g of CONTROLS){
   host.appendChild(d);
 }
 
+/* ---- export button, appended to the video section ---- */
+{
+  const vid = [...host.querySelectorAll('details')]
+    .find(d => d.querySelector('summary').textContent.startsWith('Video'));
+  if (vid){
+    const body = vid.querySelector('.body');
+    const box = document.createElement('div');
+    box.innerHTML = `<div class="btnrow"><button id="expBtn">Export video</button></div>
+      <div class="hint" id="expDerived"></div>
+      <div class="hint" id="expStatus" style="margin-top:4px"></div>`;
+    body.appendChild(box);
+    box.querySelector('#expBtn').addEventListener('click', exportVideo);
+    for (const k of ['vidFlight','vidMsPerFrame','vidFps'])
+      sliders[k].inp.addEventListener('input', updateExportDerived);
+  }
+}
+function updateExportDerived(){
+  const el = document.getElementById('expDerived');
+  if (!el) return;
+  const total = Math.max(1, Math.round(P.vidFlight / P.vidMsPerFrame));
+  const vidSec = total / P.vidFps;
+  const slow = 1000 / (P.vidMsPerFrame * P.vidFps);
+  el.innerHTML = `<b>${total}</b> frames → <b>${vidSec.toFixed(1)} s</b> of video, ` +
+    `playing at <b>${slow >= 1 ? slow.toFixed(0)+'× slow motion' : (1/slow).toFixed(1)+'× fast'}</b>.`;
+}
+
 /* ---- physical model selector ---- */
 {
   const d = document.createElement('details');
@@ -2822,7 +3301,7 @@ for (const g of CONTROLS){
     <div class="hint" id="modelWhy" style="margin-top:6px"></div></div>`;
   host.appendChild(d);
   d.querySelector('#modelSel').addEventListener('change', e => {
-    OPT.model = e.target.value; buildGrid(); scheduleURLSync(); updateMetrics();
+    OPT.model = e.target.value; buildGrid(); scheduleURLSync(true); updateMetrics();
   });
 }
 function modelBlurb(){
@@ -2908,7 +3387,7 @@ const QUALITY = [
     const b = document.createElement('button');
     b.innerHTML = `<b>${q.n}</b><i>${q.d}</i>`;
     b.addEventListener('click', () => {
-      Object.assign(P, q.q); syncSliders(); buildGrid(); scheduleURLSync(); updateMetrics();
+      Object.assign(P, q.q); syncSliders(); buildGrid(); scheduleURLSync(true); updateMetrics();
     });
     row.appendChild(b);
   }
@@ -2929,7 +3408,7 @@ const QUALITY = [
       if (pr.auto === 'ld4')
         P.exitR = Math.round(Math.cbrt(P.boreR*P.boreR*Math.min(P.stroke, maxStroke())/8) * 2) / 2;
       syncSliders();
-      buildGrid(); scheduleURLSync(); updateMetrics();
+      buildGrid(); scheduleURLSync(true); updateMetrics();
     });
     row.appendChild(b);
   }
@@ -3038,18 +3517,45 @@ function pushStateToDOM(){
   const ac = document.getElementById('autoPace'); if (ac) ac.checked = OPT.autoPace;
 }
 
-let urlTimer = 0;
-function scheduleURLSync(){
-  clearTimeout(urlTimer);
-  urlTimer = setTimeout(() => {
-    const q = encodeState();
-    try { history.replaceState(null, '', q ? '#' + q : location.pathname + location.search); }
-    catch (e) { location.hash = q; }        // file:// rejects replaceState in some browsers
-    const n = (location.href || '').length;
-    const el = document.getElementById('urlLen');
-    if (el) el.textContent = n + ' chars';
-  }, 250);
+let urlTimer = 0, selfNav = false;
+
+/* Dragging a slider replaces the current entry (no history spam); a discrete action --
+   a preset, a model change, resetting to defaults -- pushes one, so it can be undone. */
+function writeURL(push){
+  const q = encodeState();
+  const url = q ? '#' + q : location.pathname + location.search;
+  selfNav = true;
+  try { push ? history.pushState(null, '', url) : history.replaceState(null, '', url); }
+  catch (e) { location.hash = q; }          // file:// rejects pushState in some browsers
+  setTimeout(() => { selfNav = false; }, 0);
+  const el = document.getElementById('urlLen');
+  if (el) el.textContent = (location.href || '').length + ' chars';
 }
+
+function scheduleURLSync(push){
+  clearTimeout(urlTimer);
+  if (push){ writeURL(true); return; }
+  urlTimer = setTimeout(() => writeURL(false), 250);
+}
+
+/* Back and forward must actually restore the configuration, and restart the shot --
+   otherwise you are looking at one geometry's flow inside another geometry's barrel. */
+function onHistoryNav(){
+  clearTimeout(urlTimer);
+  Object.assign(P, DEFAULTS);               // clear first: the target URL may omit keys
+  OPT.model = 'auto'; OPT.autoPace = true;
+  VIEW.field = 0; VIEW.gain = 1; VIEW.showGeom = true;
+  applyStateFromURL();
+  pushStateToDOM();
+  pendingRebuild = false;
+  buildGrid();                              // rebuilds and resets the simulation
+  S.running = true; DOM.pause.textContent = 'Pause';
+  const el = document.getElementById('urlLen');
+  if (el) el.textContent = (location.href || '').length + ' chars';
+  updateMetrics();
+}
+window.addEventListener('popstate', onHistoryNav);
+window.addEventListener('hashchange', () => { if (!selfNav) onHistoryNav(); });
 
 /* ---- buttons & keys ---- */
 document.getElementById('fire').addEventListener('click', () => {
@@ -3063,9 +3569,7 @@ DOM.pause.addEventListener('click', e => {
 });
 document.getElementById('share').addEventListener('click', async e => {
   clearTimeout(urlTimer);
-  const q = encodeState();
-  try { history.replaceState(null, '', q ? '#' + q : location.pathname + location.search); }
-  catch (err) { location.hash = q; }
+  writeURL(false);
   const url = location.href;
   const done = ok => {
     // the hash is already written, so if the clipboard is unavailable (no secure context,
@@ -3088,7 +3592,7 @@ document.getElementById('defaults').addEventListener('click', () => {
   Object.assign(P, DEFAULTS);
   OPT.model = 'auto'; OPT.autoPace = true;
   VIEW.field = 0; VIEW.gain = 1; VIEW.showGeom = true;
-  pushStateToDOM(); buildGrid(); scheduleURLSync(); updateMetrics();
+  pushStateToDOM(); buildGrid(); scheduleURLSync(true); updateMetrics();
 });
 
 window.addEventListener('keydown', e => {
@@ -3104,7 +3608,7 @@ let lastWall = performance.now(), lastUi = 0, fps = 60;
 function frame(){
   if (pendingRebuild && !S.running){ buildGrid(); pendingRebuild = false; }
 
-  if (S.running && !S.diverged){
+  if (S.running && !S.diverged && !EXPORTING){
     if (pendingRebuild){ buildGrid(); pendingRebuild = false; }
     let simmed = 0;
     const n = OPT.autoPace ? Math.max(1, Math.round(S.spfAuto)) : P.spf;
@@ -3133,7 +3637,7 @@ function frame(){
     S.rdProbe.tag = S.t;
     readerIssue(S.rdProbe, S.vel.read.fbo, probeIz().iz, 0, 1, S.Nr + 1);
   }
-  render();
+  if (!EXPORTING) render();
 
   const now = performance.now();
   const wall = Math.min(Math.max(now - lastWall, 1), 500);
@@ -3153,6 +3657,7 @@ function frame(){
   if (now - lastUi > 90){
     lastUi = now;
     drawPlot();
+    drawLegend(S.colourScale || 1);
     updateMetrics();
     DOM.scalebar.textContent =
       `domain ${S.Lz.toFixed(0)} × ${(2*S.Rmax).toFixed(0)} mm   grid ${S.Nz} × ${S.Nr}   ` +
@@ -3198,6 +3703,7 @@ function flagDivergence(v){
   if (!CP.ok) OPT.model = 'incompressible';
   applyStateFromURL();
   pushStateToDOM();
+  updateExportDerived();
   buildGrid();
   scheduleURLSync();
   S.passUs = usedGPU ? 0 : measurePassCost();

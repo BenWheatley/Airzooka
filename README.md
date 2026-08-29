@@ -202,6 +202,54 @@ versus a straight shear tube that never pinches off — is robust and reproduces
 resolution. The **measured velocities at the target plane are good to about a factor of two**
 and should only ever be used to rank designs, never quoted.
 
+## Colour legend
+
+Every field is drawn with a labelled legend in the corner of the viewport: the colour ramp,
+the quantity, its units and the numeric range. The scale is whatever the shader actually used
+that frame, including the colour-gain slider, so it never drifts from what is on screen.
+
+| field | units |
+|---|---|
+| tracer | fraction, 0–1 |
+| speed \|u\| | m/s |
+| vorticity ω_θ | 1/ms |
+| pressure | Pa relative to ambient (compressible) or m²/s² kinematic (incompressible) |
+| axial velocity u_z | m/s |
+| Mach number | dimensionless, with a white contour at M = 1 |
+| schlieren | relative \|∇ρ\| |
+
+The two pressure fields genuinely differ: the incompressible solver works at ρ = 1 and its
+pressure is kinematic, so labelling both "Pa" would have been wrong.
+
+## Video export
+
+Exports a WebM to disk. The interactive solver chooses its timestep adaptively, which is right
+on screen and wrong for video — frames would represent unequal slices of time and the motion
+would be subtly, invisibly wrong. **Export therefore runs on a fixed schedule: every video
+frame advances exactly the same simulated interval**, subdivided into as many equal sub-steps
+as stability requires. The sub-step count varies between frames; the frame interval never
+does. Verified: 30 exported frames, all frame intervals exactly 0.2000000 ms.
+
+Frames carry a burned-in clock, the configuration, the colour legend and a physical scale bar,
+so a shared clip is self-describing.
+
+Set flight time to record, flight time per frame, frame rate, width and bitrate; the panel
+shows the resulting frame count, video length and slow-motion factor. Export settings are
+deliberately **not** in the shareable link — they describe the recording, not the physics.
+
+Two implementation notes worth keeping:
+
+- **WebCodecs, not MediaRecorder.** `MediaRecorder` timestamps frames by wall clock, so a
+  simulation slower or faster than real time comes out stretched. `VideoEncoder` takes an
+  explicit timestamp per frame, which decouples the video's time base from how long the
+  computation took. WebCodecs emits encoded chunks and no container, so there is a small
+  Matroska/WebM muxer here: one video track, SimpleBlocks in Clusters.
+- **Rendering to an owned texture, not the canvas.** A WebGPU canvas does not present until a
+  task boundary, so `drawImage()` immediately after `submit()` returns a blank frame — the
+  first version of this exported 30 perfectly-timed black frames. Export renders into its own
+  texture and copies it out, which is deterministic and works at any resolution without
+  disturbing the visible canvas.
+
 ## Shareable links
 
 Every setting is serialised into the URL fragment, so a link reproduces a configuration
@@ -224,6 +272,12 @@ limit is 32779. Three choices keep it that short:
 - **The fragment, not the query string.** The fragment is never sent to a server, so no
   server request-line limit (Apache 8190, nginx 8192) applies at all — and assigning
   `location.hash` works on `file://` URLs, where Chrome throws on `history.replaceState`.
+
+Back and forward work properly: discrete actions (a preset, a model change, resetting to
+defaults) push a history entry, while dragging a slider replaces the current one so the
+history does not fill with intermediate values. Navigating restores the configuration **and
+restarts the shot** — otherwise you would be watching one geometry's flow inside another
+geometry's barrel.
 
 Links are validated on the way in: values are clamped to their slider range, unknown keys and
 unparseable numbers are ignored. A hand-edited `#br=99999&er=-50&rs=abc&md=77` loads as a
